@@ -174,7 +174,8 @@ ggml_tensor * mtmd_graph_deepseekocr::build_sam(ggml_tensor * inp_raw) {
         {
             const int B = cur->ne[3];
 
-            cur = ggml_mul_mat(ctx0, layer.qkv_w, cur);
+            // flatten to 2D first: Vulkan can't broadcast src0 over dim 3 (falls back to CPU otherwise)
+            cur = ggml_mul_mat(ctx0, layer.qkv_w, ggml_reshape_2d(ctx0, cur, cur->ne[0], W * H * B));
             cur = ggml_add(ctx0, cur, layer.qkv_b);
             cur = ggml_reshape_4d(ctx0, cur, n_embd, 3, W * H, B);
 
@@ -201,12 +202,20 @@ ggml_tensor * mtmd_graph_deepseekocr::build_sam(ggml_tensor * inp_raw) {
             qr = ggml_permute(ctx0, Q, 0, 2, 1, 3);
             qr = ggml_reshape_4d(ctx0, ggml_cont(ctx0, qr), d_heads, W, H, B * n_heads);
 
+            // fold B*n_heads into dim 1 so the 3D rel-pos tables don't broadcast over dim 3
+            // (unsupported on Vulkan -> CPU fallback); same math as the 4D form
             rw = ggml_mul_mat(ctx0, rw,
-                              ggml_cont(ctx0, ggml_permute(ctx0, qr, 0, 2, 1, 3))); // [B*n_heads, W, H, W]
-            rw   = ggml_cont(ctx0, ggml_permute(ctx0, rw, 0, 2, 1, 3)); // [B*n_heads, H, W, W]
+                              ggml_reshape_3d(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, qr, 0, 3, 1, 2)),
+                                              d_heads, H * B * n_heads, W)); // [W, H*B*n_heads, W]
+            rw   = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_4d(ctx0, rw, W, H, B * n_heads, W),
+                                                0, 2, 3, 1)); // [B*n_heads, H, W, W]
             rw   = ggml_reshape_4d(ctx0, rw, W, 1, W * H, n_heads * B);
             rw   = ggml_repeat_4d(ctx0, rw, W, H, W * H, n_heads * B);
-            rh   = ggml_mul_mat(ctx0, rh, qr); // [B*n_heads, H, W, H]
+            rh   = ggml_mul_mat(ctx0, rh,
+                                ggml_reshape_3d(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, qr, 0, 1, 3, 2)),
+                                                d_heads, W * B * n_heads, H)); // [H, W*B*n_heads, H]
+            rh   = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_4d(ctx0, rh, H, W, B * n_heads, H),
+                                                0, 1, 3, 2)); // [B*n_heads, H, W, H]
             rh   = ggml_reshape_4d(ctx0, rh, 1, H, W * H, n_heads * B);
             mask = ggml_add(ctx0, rw, rh); // [B*n_heads, H*W, H, W]
             mask = ggml_reshape_4d(ctx0, mask, W * H, W * H, n_heads, B);
