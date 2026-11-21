@@ -130,6 +130,41 @@ struct llm_build_rwkv7_base : public llm_graph_context {
 // models
 //
 
+struct llama_model_dory : public llama_model_base {
+    llama_model_dory(const llama_model_params & params) : llama_model_base(params) {}
+    // The looped graph is far larger than its shared weights: the PR's budget,
+    // 128 nodes a layer, spread over the tensors.
+    uint32_t graph_nodes_per_tensor() const override {
+        const uint64_t nt = std::max<uint64_t>(1, n_tensors());
+        return std::max<uint32_t>(8u, (uint32_t) ((128ull*hparams.n_layer() + nt - 1)/nt));
+    }
+    uint32_t n_input = 0, n_recurrent = 0, n_output = 0, n_loops = 0;
+    float init_std = 0.0f, alpha_init = 0.0f, gate_init = 0.0f;
+    float theta_1 = 0.0f, theta_2 = 0.0f;
+    std::string pattern;
+    std::string recurrent_kv_cache_mode = "per_loop";
+    std::vector<uint32_t> profile;
+    std::vector<int> physical;
+    std::vector<int> cache_layer;
+    uint32_t n_layer_physical() const override { return n_input + n_recurrent + n_output; }
+    int layer_physical(int il) const override { return physical.at(il); }
+    struct scales {
+        ggml_tensor * alpha = nullptr;
+        ggml_tensor * sqk = nullptr;
+        ggml_tensor * gate = nullptr;
+        ggml_tensor * suv_gate = nullptr;
+        ggml_tensor * suv_up = nullptr;
+    };
+    std::vector<scales> scale;
+    ggml_tensor * logit_scale = nullptr;
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+    struct graph : public llm_graph_context {
+        graph(const llama_model_dory & model, const llm_graph_params & params);
+    };
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
 struct llama_model_llama : public llama_model_base {
     llama_model_llama(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
