@@ -657,13 +657,18 @@ static void ggml_backend_metal_event_wait(ggml_backend_t backend, ggml_backend_e
 static void ggml_backend_metal_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
     GGML_ASSERT(params && params->add_alloc_dep);
 
-    // keep the MoE weighted-reduction inputs alive until the fused output so the
-    // allocator cannot reuse them while the fused kernel is still reading them
-    ggml_metal_fusion_add_alloc_deps(params->user_data, params->add_alloc_dep, cgraph);
-
     ggml_metal_t ctx = (ggml_metal_t)backend->context;
 
     ggml_metal_graph_optimize(ctx, cgraph);
+
+    // keep the MoE weighted-reduction inputs alive until the fused output so the
+    // allocator cannot reuse them while the fused kernel is still reading them
+    //
+    // collected on the reordered graph, the one the kernels are encoded from: the patterns match op types alone, so
+    // on the graph before the reorder two unrelated neighbours (ADD, ADD) could match, and once the reorder moved the
+    // second ahead of the producer of one of the first's inputs, the kept tensor was allocated at the dependency,
+    // before it was computed, reusing a live parent in place
+    ggml_metal_fusion_add_alloc_deps(params->user_data, params->add_alloc_dep, cgraph);
 }
 
 static void ggml_backend_metal_set_n_cb(ggml_backend_t backend, int n_cb) {
