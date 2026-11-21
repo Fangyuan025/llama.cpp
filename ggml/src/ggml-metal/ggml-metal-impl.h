@@ -132,6 +132,8 @@
 #define FC_MUL_MV_MMA                  2300
 #define FC_TOP_K_MASK                  2400
 #define FC_GROUP_NORM                  2500
+#define FC_OLALA_MOE                  2300
+#define FC_OLALA_TPA                  2400
 
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8
@@ -150,6 +152,13 @@
 #define OP_LIGHTNING_INDEXER_NKPSG   8
 #define OP_LIGHTNING_INDEXER_NSG     8
 #define OP_LIGHTNING_INDEXER_NBPTG   8
+
+// Olala Mamba3-MIMO (kernels/mamba3.metal): threads/simdgroups per threadgroup, chunk length of
+// the chunked (prefill) path, max MIMO rank of the generic path
+#define OP_MAMBA3_MIMO_NTH   256
+#define OP_MAMBA3_MIMO_NSG   8
+#define OP_MAMBA3_MIMO_CHUNK 32
+#define OP_MAMBA3_MIMO_MAX_R 8
 
 #define OP_UNARY_NUM_SCALE      10
 #define OP_UNARY_NUM_FILL       11
@@ -1038,6 +1047,176 @@ typedef struct {
     uint64_t nb3;
     uint64_t nb_out; // 0 => snapshots are appended after the attn scores (unfused)
 } ggml_metal_kargs_gated_delta_net;
+
+// Olala Mamba3-MIMO mixer core (kernels/mamba3.metal); all strides/offsets in floats
+typedef struct {
+    int32_t D_qk;
+    int32_t R;
+    int32_t D_v;
+    int32_t H;
+    int32_t T;            // tokens per sequence
+    int32_t n_seqs;
+    int32_t n_chunks;     // chunked path only (1 otherwise)
+    int32_t pad0;
+    int64_t pdyn_s;       // token stride of pdyn
+    int64_t pstat_s;      // token stride of pstat
+    int64_t s_in_s;       // seq stride of the input state
+    int64_t s_out_s;      // seq stride of the output state (n_embd_s, or the cache row stride when fused)
+    int64_t off_K;        // packed state section offsets: [S | k_prev | v_prev | ang]
+    int64_t off_V;
+    int64_t off_A;
+    int64_t ws_state_off; // chunked path workspace: [ang | chunk states | chunk decays]
+    int64_t ws_decay_off;
+    float   eps;
+    float   a_floor;
+} ggml_metal_kargs_mamba3_mimo;
+
+// Olala geodesic residual (kernels/mamba3.metal)
+typedef struct {
+    int32_t  ne00;
+    int32_t  ne01;
+    int32_t  ne02;
+    int32_t  ne03;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+    float    inv_depth;
+} ggml_metal_kargs_geodesic;
+
+// fused Olala MoE kernel (kernel_olala_moe_f): layout of the device sync scratch (32-bit words, one 128-byte line
+// per barrier word), shared with the host
+#define GGML_METAL_DMOE_F_B1   0
+#define GGML_METAL_DMOE_F_R1   32
+#define GGML_METAL_DMOE_F_B2   64
+#define GGML_METAL_DMOE_F_R2   96
+#define GGML_METAL_DMOE_F_B3   128
+#define GGML_METAL_DMOE_F_R3   160
+#define GGML_METAL_DMOE_F_EXIT 192
+#define GGML_METAL_DMOE_F_ERR  224                 // set when a wait timed out (threadgroups not all resident)
+#define GGML_METAL_DMOE_F_ACC  256                 // n_lat floats
+#define GGML_METAL_DMOE_F_DSH  (256 + GGML_METAL_DMOE_F_MAX_LAT) // n_embd floats
+#define GGML_METAL_DMOE_F_MAX_LAT  1024
+#define GGML_METAL_DMOE_F_MAX_EMBD 2048
+
+// Olala latent MoE block (kernels/mamba3.metal); workspace offsets in floats, after dst
+typedef struct {
+    int32_t n_embd;
+    int32_t n_tok;
+    int32_t n_lat;
+    int32_t n_expert;
+    int32_t n_ff;
+    int32_t n_ff_sh;
+    int32_t k;
+    int32_t nsplit;     // threadgroups per (token, expert slot): FF row slices (up) / n_lat row slices (down)
+    float   w_scale;
+    int32_t tb;         // tokens per pass in the input projections (<= DMOE_TB)
+    int32_t tbc;        // tokens per threadgroup in the output projections (<= 2)
+    int32_t nsplit2;    // n_lat row slices of kernel b2 (each threadgroup sums the k experts of its rows)
+    int64_t off_lat;    // (n_lat, n_tok)
+    int64_t off_logits; // (n_expert, n_tok)
+    int64_t off_ush;    // (n_ff_sh, n_tok)  relu^2 of the shared-expert up projection
+    int64_t off_sel;    // (k, n_tok) selected experts (as float)
+    int64_t off_wk;     // (k, n_tok) expert weights
+    int64_t off_h;      // (n_ff, k, n_tok) relu^2 of the expert up projections
+    int64_t off_o;      // (n_lat, k, n_tok) weighted expert outputs
+    int64_t off_cnt;    // uint counter of the finished threadgroups of kernel c (reset by kernel a)
+    int64_t off_dsh;    // (n_embd, n_tok) shared-expert down projection (sh_split)
+    int32_t geo;        // 1: the last threadgroup of kernel c applies the following GEODESIC (fused)
+    float   geo_inv_depth;
+    int32_t sh_split;   // 1: shared-expert up in extra threadgroups of b1, down in extra threadgroups of b2
+    int32_t pre_geo;    // 1: the input is GEODESIC(x, g), computed by every threadgroup of kernel a (fused)
+    float   pre_geo_inv_depth;
+    int32_t merged;     // 1: kernel m (routed up + down, shared up + down) replaces b1 and b2, sums by float atomics
+    int32_t sh_rows;    // merged: shared-expert FF rows per threadgroup
+    int32_t a_ks;       // 2: kernel a splits every row across two simdgroups (4 rows per threadgroup)
+    int64_t off_acc;    // merged: (n_lat, n_tok) weighted sum of the expert outputs (zeroed by kernel a, as dsh)
+    int32_t pad3;
+    int32_t pad4;
+} ggml_metal_kargs_olala_moe;
+
+// Olala V-layer helpers (kernels/mamba3.metal)
+typedef struct {
+    int32_t n_embd;
+    int32_t n_tok;
+    int32_t n_ws;
+    int32_t tb;         // tokens per pass (<= 4)
+    int32_t rows[9];    // rows of each weight matrix
+    int32_t off[9];     // first output row of each matrix
+    int32_t rows_total;
+    int32_t nsg;        // simdgroups per threadgroup
+} ggml_metal_kargs_olala_mmv;
+
+typedef struct {
+    int32_t H;
+    int32_t Hn;
+    int32_t R;
+    int32_t Dh;
+    int32_t Hs;
+    int32_t n_seqs;
+    int32_t n_tok;
+    int32_t ROW;
+    int32_t GS;         // gate elements written per (head, token) threadgroup (0: head 0 writes all)
+    int32_t factored;   // ggml_olala_tpa_prep_factored: rows of TPA factors instead of K/V (KR / VR floats per token)
+    float   eps;
+    float   wsize;
+    float   gate_b;
+    int32_t pad1;
+    int64_t prev_s;     // seq stride of prev (floats)
+    int64_t o_k;        // output offsets (floats)
+    int64_t o_v;
+    int64_t o_lam;
+    int64_t o_g;
+    int64_t o_last;
+    // GGML_METAL_FUSION_TPA_PREP_CACHE (one token per sequence): K/V rows also written into the KV cache at the rows
+    // given by k_idx/v_idx, and the pre-shift last K/V into the recurrent cache (the CPY and SET_ROWS are skipped)
+    int32_t fuse;
+    int32_t kv_f16;     // KV cache type: 1 = f16, 0 = f32
+    uint64_t kc_nb1;    // KV cache row strides (bytes)
+    uint64_t vc_nb1;
+    int64_t last_s;     // recurrent cache row stride (floats)
+    int32_t KR;
+    int32_t VR;
+} ggml_metal_kargs_olala_tpa_prep;
+
+// GGML_OP_OLALA_TPA_ATTN (kernels/mamba3.metal): one threadgroup per (chunk of cells, token, stream), then a reduce
+// over the chunks when n_chunk > 1 (partials after dst: [m, l, o (Dh)] per (chunk, head, token, stream))
+typedef struct {
+    int32_t H;
+    int32_t Hn;
+    int32_t R;
+    int32_t Dh;
+    int32_t KR;
+    int32_t VR;
+    int32_t n_kv;
+    int32_t T;
+    int32_t ns;
+    int32_t n_chunk;
+    int32_t chunk;      // cells per chunk (multiple of the 8 cells of a block)
+    float   scale;
+    float   softcap;
+    int32_t mask_f16;
+    int32_t is_v;       // kernel_olala_tpa_expand: 1 for V
+    uint64_t nbq1, nbq2, nbq3;
+    uint64_t nbk1, nbk2;
+    uint64_t nbv1, nbv2;
+    uint64_t nbm1, nbm3;
+    uint64_t nbp1;
+} ggml_metal_kargs_olala_tpa_attn;
+
+typedef struct {
+    int32_t Dh;
+    int32_t H;
+    int32_t Hn;
+    int32_t T;
+    int64_t lam_s;      // token stride of lam (floats)
+    int64_t gs_s;       // token stride of gs (floats)
+} ggml_metal_kargs_olala_diff_gate;
 
 typedef struct {
     int32_t  ne00;

@@ -8,6 +8,7 @@
 #include "llama-vocab.h"
 
 #include <map>
+#include <mutex>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -712,6 +713,37 @@ struct llama_layer {
     struct ggml_tensor * ffn_post_conv    = nullptr;
     struct ggml_tensor * ffn_res_query    = nullptr;
 
+    // Olala Mamba3-MIMO (M layer)
+    struct ggml_tensor * ssm_in_dyn  = nullptr; // in_proj_dyn (hidden, 2·R·d_state + num_rope_angles)
+    struct ggml_tensor * ssm_b_bias  = nullptr; // per-head bias on B  (n_head, R, d_state)
+    struct ggml_tensor * ssm_c_bias  = nullptr; // per-head bias on C  (n_head, R, d_state)
+    struct ggml_tensor * ssm_dt_bias = nullptr; // per-head dt bias    (n_head)
+    struct ggml_tensor * ssm_mimo_x  = nullptr; // (n_head, R, headdim)
+    struct ggml_tensor * ssm_mimo_z  = nullptr; // (n_head, R, headdim)
+    struct ggml_tensor * ssm_mimo_o  = nullptr; // (n_head, R, headdim)
+    // packed GGML_OP_MAMBA3_MIMO constants (optional; built from the above by the converter)
+    struct ggml_tensor * ssm_m3_bias  = nullptr;
+    struct ggml_tensor * ssm_m3_mxz   = nullptr;
+    struct ggml_tensor * ssm_m3_norms = nullptr;
+    struct ggml_tensor * ssm_m3_misc  = nullptr;
+
+    // Olala Diff-TPA-V2 (V layer)
+    struct ggml_tensor * attn_wa_k           = nullptr; // (hidden, n_kv · rank)
+    struct ggml_tensor * attn_wa_v           = nullptr; // (hidden, n_kv · rank)
+    struct ggml_tensor * attn_wb_k           = nullptr; // (hidden, rank · head_dim)
+    struct ggml_tensor * attn_wb_v           = nullptr; // (hidden, rank · head_dim)
+    struct ggml_tensor * attn_shift_k        = nullptr; // (hidden, n_kv)
+    struct ggml_tensor * attn_shift_v        = nullptr; // (hidden, n_kv)
+    struct ggml_tensor * attn_lambda         = nullptr; // (hidden, n_noise)
+    struct ggml_tensor * attn_softmax_scaler = nullptr; // (n_head,)
+    struct ggml_tensor * attn_gate           = nullptr; // (hidden, n_signal · head_dim)  block-level gate, V-only
+
+    // Olala geodesic-residual (two pairs per block, each is a scalar tensor of size 1)
+    struct ggml_tensor * geo_mixer_scale = nullptr;
+    struct ggml_tensor * geo_mixer_bias  = nullptr;
+    struct ggml_tensor * geo_mlp_scale   = nullptr;
+    struct ggml_tensor * geo_mlp_bias    = nullptr;
+
     struct llama_layer_posnet posnet;
 
     struct llama_layer_convnext convnext;
@@ -813,6 +845,12 @@ struct llama_model {
     std::string name = "n/a";
 
     llama_hparams hparams = {};
+
+private:
+    mutable std::once_flag                 hparams_tpa_once;
+    mutable std::unique_ptr<llama_hparams> hparams_tpa;
+
+public:
     llama_vocab   vocab;
 
     // per-tensor activation precision policy
@@ -1000,6 +1038,9 @@ struct llama_model {
     // which tensors can be prefetched - driven by TENSOR_READ_LAZY
     std::unordered_set<const ggml_tensor *> can_prefetch;
 
+    // RAM budget (MiB) for the data of those tensors that stays resident, -1 = arch default
+    int32_t lazy_cache_mib = -1;
+
     // statically allocated context for assigning
     struct llama_meta_device_get_split_state_userdata get_split_state_ud;
 
@@ -1059,6 +1100,11 @@ struct llama_model {
 
     // apply Hadamard transform to the lightning indexer keys
     virtual bool lid_k_hdmd() const { return false; }
+
+    // TPA attention (Olala): whether a context with this llama_tpa_cache_type keeps the TPA factors in its KV cache,
+    // and the hparams of that cache layout (the attention layers' K/V rows are the factor rows)
+    bool tpa_cache_factored(llama_tpa_cache_type type) const;
+    const llama_hparams & hparams_tpa_factored() const;
 
     ggml_cgraph * build_graph(const llm_graph_params & params) const;
 

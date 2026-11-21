@@ -797,6 +797,7 @@ class MODEL_ARCH(IntEnum):
     INKLING2         = auto()
     INKLING2_LOOP    = auto()
     DOMYN_EDGE       = auto()
+    OLALA           = auto()
 
 
 class VISION_PROJECTOR_TYPE(IntEnum):
@@ -947,6 +948,20 @@ class MODEL_TENSOR(IntEnum):
     FFN_POST_EXP_NORM    = auto()
     ATTN_Q_NORM          = auto()
     ATTN_K_NORM          = auto()
+    # Olala Differential-TPA-V2 attention
+    ATTN_WA_K            = auto() # Olala: TPA factor A for K
+    ATTN_WA_V            = auto() # Olala: TPA factor A for V
+    ATTN_WB_K            = auto() # Olala: TPA factor B for K
+    ATTN_WB_V            = auto() # Olala: TPA factor B for V
+    ATTN_SHIFT_K         = auto() # Olala: token-shift α projection for K
+    ATTN_SHIFT_V         = auto() # Olala: token-shift α projection for V
+    ATTN_LAMBDA          = auto() # Olala: diff-V2 λ projection
+    ATTN_SOFTMAX_SCALER  = auto() # Olala: per-head scaler for scalable softmax
+    # Olala geodesic-residual update (one pair per residual; two per block)
+    GEODESIC_MIXER_SCALE = auto() # Olala
+    GEODESIC_MIXER_BIAS  = auto() # Olala
+    GEODESIC_MLP_SCALE   = auto() # Olala
+    GEODESIC_MLP_BIAS    = auto() # Olala
     LAYER_OUT_NORM       = auto()
     LAYER_OUT_SCALE      = auto()
     ATTN_VRES_LAMBDA     = auto()
@@ -1001,6 +1016,18 @@ class MODEL_TENSOR(IntEnum):
     FFN_RESID_SCALE      = auto() # limite
     MUDD_DOWN            = auto() # limite
     MUDD_UP              = auto() # limite
+    # Olala Mamba3-MIMO
+    SSM_IN_DYN           = auto() # Olala
+    SSM_B_BIAS           = auto() # Olala
+    SSM_C_BIAS           = auto() # Olala
+    SSM_DT_BIAS          = auto() # Olala
+    SSM_MIMO_X           = auto() # Olala
+    SSM_MIMO_Z           = auto() # Olala
+    SSM_MIMO_O           = auto() # Olala
+    SSM_M3_BIAS          = auto() # Olala (packed [b_bias | c_bias])
+    SSM_M3_MXZ           = auto() # Olala (packed [mimo_x | mimo_z])
+    SSM_M3_NORMS         = auto() # Olala (packed [b_norm | c_norm])
+    SSM_M3_MISC          = auto() # Olala (packed [dt_bias | D])
     TIME_MIX_W0          = auto()
     TIME_MIX_W1          = auto()
     TIME_MIX_W2          = auto()
@@ -1813,6 +1840,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.INKLING2:         "inkling2",
     MODEL_ARCH.INKLING2_LOOP:    "inkling2_loop",
     MODEL_ARCH.DOMYN_EDGE:       "domynedge",
+    MODEL_ARCH.OLALA:           "olala",
 }
 
 VISION_PROJECTOR_TYPE_NAMES: dict[VISION_PROJECTOR_TYPE, str] = {
@@ -2015,6 +2043,29 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.FFN_RESID_SCALE:           "blk.{bid}.ffn_resid_scale",      # limite
     MODEL_TENSOR.MUDD_DOWN:                 "blk.{bid}.mudd_down",            # limite
     MODEL_TENSOR.MUDD_UP:                   "blk.{bid}.mudd_up",              # limite
+    MODEL_TENSOR.SSM_IN_DYN:                "blk.{bid}.ssm_in_dyn",           # Olala
+    MODEL_TENSOR.SSM_B_BIAS:                "blk.{bid}.ssm_b_bias",           # Olala
+    MODEL_TENSOR.SSM_C_BIAS:                "blk.{bid}.ssm_c_bias",           # Olala
+    MODEL_TENSOR.SSM_DT_BIAS:               "blk.{bid}.ssm_dt_bias",          # Olala
+    MODEL_TENSOR.SSM_MIMO_X:                "blk.{bid}.ssm_mimo_x",           # Olala
+    MODEL_TENSOR.SSM_MIMO_Z:                "blk.{bid}.ssm_mimo_z",           # Olala
+    MODEL_TENSOR.SSM_MIMO_O:                "blk.{bid}.ssm_mimo_o",           # Olala
+    MODEL_TENSOR.SSM_M3_BIAS:               "blk.{bid}.ssm_m3_bias",          # Olala
+    MODEL_TENSOR.SSM_M3_MXZ:                "blk.{bid}.ssm_m3_mxz",           # Olala
+    MODEL_TENSOR.SSM_M3_NORMS:              "blk.{bid}.ssm_m3_norms",         # Olala
+    MODEL_TENSOR.SSM_M3_MISC:               "blk.{bid}.ssm_m3_misc",          # Olala
+    MODEL_TENSOR.ATTN_WA_K:                 "blk.{bid}.attn_wa_k",            # Olala
+    MODEL_TENSOR.ATTN_WA_V:                 "blk.{bid}.attn_wa_v",            # Olala
+    MODEL_TENSOR.ATTN_WB_K:                 "blk.{bid}.attn_wb_k",            # Olala
+    MODEL_TENSOR.ATTN_WB_V:                 "blk.{bid}.attn_wb_v",            # Olala
+    MODEL_TENSOR.ATTN_SHIFT_K:              "blk.{bid}.attn_shift_k",         # Olala
+    MODEL_TENSOR.ATTN_SHIFT_V:              "blk.{bid}.attn_shift_v",         # Olala
+    MODEL_TENSOR.ATTN_LAMBDA:               "blk.{bid}.attn_lambda",          # Olala
+    MODEL_TENSOR.ATTN_SOFTMAX_SCALER:       "blk.{bid}.attn_softmax_scaler",  # Olala
+    MODEL_TENSOR.GEODESIC_MIXER_SCALE:      "blk.{bid}.geo_mixer_scale",      # Olala
+    MODEL_TENSOR.GEODESIC_MIXER_BIAS:       "blk.{bid}.geo_mixer_bias",       # Olala
+    MODEL_TENSOR.GEODESIC_MLP_SCALE:        "blk.{bid}.geo_mlp_scale",        # Olala
+    MODEL_TENSOR.GEODESIC_MLP_BIAS:         "blk.{bid}.geo_mlp_bias",         # Olala
     MODEL_TENSOR.TIME_MIX_W0:               "blk.{bid}.time_mix_w0",
     MODEL_TENSOR.TIME_MIX_W1:               "blk.{bid}.time_mix_w1",
     MODEL_TENSOR.TIME_MIX_W2:               "blk.{bid}.time_mix_w2",
@@ -7234,6 +7285,58 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_GATE,
         MODEL_TENSOR.OUTPUT_NORM,
     ],
+    MODEL_ARCH.OLALA: [
+        # Embedding / output. No final RMSNorm (config.final_norm == false).
+        # No block-level input/postmixer norms either — geodesic_update=true makes
+        # those nn.Identity. Only the in-mixer norms (q_norm, k_norm, B_norm, C_norm) survive.
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ATTN_OUT,        # mixer_proj
+        # Geodesic-residual (two pairs per block).
+        MODEL_TENSOR.GEODESIC_MIXER_SCALE,
+        MODEL_TENSOR.GEODESIC_MIXER_BIAS,
+        MODEL_TENSOR.GEODESIC_MLP_SCALE,
+        MODEL_TENSOR.GEODESIC_MLP_BIAS,
+        # M layer (Mamba3-MIMO).
+        MODEL_TENSOR.SSM_IN,          # in_proj (z, x, dt, A, trap split per head)
+        MODEL_TENSOR.SSM_IN_DYN,      # in_proj_dyn (B, C, angles)
+        MODEL_TENSOR.SSM_B_NORM,      # B_norm
+        MODEL_TENSOR.SSM_C_NORM,      # C_norm
+        MODEL_TENSOR.SSM_B_BIAS,
+        MODEL_TENSOR.SSM_C_BIAS,
+        MODEL_TENSOR.SSM_DT_BIAS,
+        MODEL_TENSOR.SSM_D,           # D skip
+        MODEL_TENSOR.SSM_MIMO_X,
+        MODEL_TENSOR.SSM_MIMO_Z,
+        MODEL_TENSOR.SSM_MIMO_O,
+        MODEL_TENSOR.SSM_M3_BIAS,
+        MODEL_TENSOR.SSM_M3_MXZ,
+        MODEL_TENSOR.SSM_M3_NORMS,
+        MODEL_TENSOR.SSM_M3_MISC,
+        # V layer (Differential-TPA-V2 attention).
+        MODEL_TENSOR.ATTN_Q,          # c_q (Q projection, full)
+        MODEL_TENSOR.ATTN_WA_K,
+        MODEL_TENSOR.ATTN_WA_V,
+        MODEL_TENSOR.ATTN_WB_K,
+        MODEL_TENSOR.ATTN_WB_V,
+        MODEL_TENSOR.ATTN_Q_NORM,
+        MODEL_TENSOR.ATTN_K_NORM,
+        MODEL_TENSOR.ATTN_SHIFT_K,
+        MODEL_TENSOR.ATTN_SHIFT_V,
+        MODEL_TENSOR.ATTN_LAMBDA,
+        MODEL_TENSOR.ATTN_SOFTMAX_SCALER,
+        MODEL_TENSOR.ATTN_GATE,       # block-level gate_proj (V layers only, but tensor list is union)
+        # MoE (sigmoid router + bias, 1536→384 bottleneck, ReLU² experts, plus dense shared expert).
+        MODEL_TENSOR.FFN_GATE_INP,    # moe_gate
+        MODEL_TENSOR.FFN_EXP_PROBS_B, # expert_bias
+        MODEL_TENSOR.MOE_LATENT_DOWN, # down_proj (1536 → 384)
+        MODEL_TENSOR.MOE_LATENT_UP,   # up_proj (384 → 1536)
+        MODEL_TENSOR.FFN_UP_EXP,      # experts.weight (routed, no gate)
+        MODEL_TENSOR.FFN_DOWN_EXP,    # experts.output_experts.weight
+        MODEL_TENSOR.FFN_UP_SHEXP,    # shared_experts.fc_1
+        MODEL_TENSOR.FFN_DOWN_SHEXP,  # shared_experts.fc_2
+    ],
+    # TODO
 }
 
 # tensors that will not be serialized

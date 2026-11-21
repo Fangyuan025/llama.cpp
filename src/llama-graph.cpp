@@ -555,6 +555,7 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
 
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
+    res &= s_copy_ident == mctx->s_copy_is_identity(params.ubatch.n_seqs);
 
     return res;
 }
@@ -690,6 +691,10 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     // (e.g. DFlash's KV-injection pass)
     if (self_attn_mask.raw && self_attn_mask.raw->buffer) {
         mctx->set_input_attn_mask(self_attn_mask, ubatch, cparams.causal_attn);
+    }
+
+    if (self_prev_cell && self_prev_cell->buffer) {
+        mctx->set_input_prev_cell(self_prev_cell, ubatch);
     }
 }
 
@@ -1250,6 +1255,10 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     // kv_rows and the mask stay unallocated if all attention layers have their own (e.g. qwen4exp QSA)
     mctx->get_attn()->set_input_attn_mask(inp_attn->self_attn_mask, ubatch, cparams.causal_attn);
 
+    if (inp_attn->self_prev_cell) {
+        mctx->get_attn()->set_input_prev_cell(inp_attn->self_prev_cell, ubatch);
+    }
+
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
     if (inp_rs->s_copy) {
@@ -1281,6 +1290,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->s_copy_ident == mctx->get_recr()->s_copy_is_identity(params.ubatch.n_seqs);
 
     return res;
 }
@@ -1326,6 +1336,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->s_copy_ident == mctx->get_recr()->s_copy_is_identity(params.ubatch.n_seqs);
 
     return res;
 }
@@ -1482,6 +1493,7 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->s_copy_ident == mctx->get_recr()->s_copy_is_identity(params.ubatch.n_seqs);
 
     return res;
 }
@@ -4242,6 +4254,7 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
 
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();
+    inp->s_copy_ident = mctx_cur->s_copy_is_identity(n_seqs);
 
     return inp;
 }

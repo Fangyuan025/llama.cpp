@@ -286,6 +286,161 @@ static bool ggml_metal_fusion_check_gdn_cache(
     return true;
 }
 
+// OLALA_TPA_PREP + CPY (pre-shift last K/V -> recurrent cache) + SET_ROWS (K -> KV cache) + SET_ROWS (V -> KV cache),
+// decode only (one token per sequence: the kernel reads the previous K/V of a sequence from the recurrent cache row it
+// then overwrites, in the same thread)
+static bool ggml_metal_fusion_check_tpa_prep_cache(
+        const ggml_metal_fusion      * fusion,
+        const ggml_tensor * const    * nodes,
+        const ggml_cgraph            * gf,
+        const int                    * node_idxs,
+              int                      idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(fusion);
+    GGML_UNUSED(gf);
+    GGML_UNUSED(node_idxs);
+    GGML_UNUSED(idx);
+
+    const ggml_tensor * prep = nodes[0];
+    const ggml_tensor * cpy  = nodes[1];
+
+    if (ggml_get_op_params_i32(prep, 9) != 0) {
+        return false; // factored rows: written by SET_ROWS
+    }
+
+    const int64_t H      = ggml_get_op_params_i32(prep, 0);
+    const int64_t Hn     = ggml_get_op_params_i32(prep, 1);
+    const int64_t Dh     = ggml_get_op_params_i32(prep, 3);
+    const int64_t Hs     = ggml_get_op_params_i32(prep, 4);
+    const int64_t n_seqs = ggml_get_op_params_i32(prep, 5);
+    const int64_t T      = prep->src[0]->ne[1];
+
+    if (T != n_seqs || prep->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const size_t f      = sizeof(float);
+    const size_t o_k    = (size_t) (T*H*Dh)*f;
+    const size_t o_v    = o_k + (size_t) (T*Hn*Dh)*f;
+    const size_t o_last = o_v + (size_t) (T*Hn*Dh + T*Hn + T*Hs*Dh)*f;
+
+    // CPY: the whole last-K/V tail into (2*Hn*Dh, n_seqs) f32 rows
+    {
+        const ggml_tensor * src = cpy->src[0];
+        const ggml_tensor * dst = cpy->src[1];
+        if (cpy->op != GGML_OP_CPY || (cpy->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+            src->view_src != prep || src->view_offs != o_last || !ggml_is_contiguous(src) ||
+            src->ne[0] != 2*Hn*Dh || ggml_nelements(src) != 2*Hn*Dh*n_seqs) {
+            return false;
+        }
+        if (dst->type != GGML_TYPE_F32 || dst->ne[0] != 2*Hn*Dh || dst->ne[1] != n_seqs || dst->ne[2] != 1 || dst->ne[3] != 1 ||
+            dst->nb[0] != f || dst->nb[1] % f != 0 || (mode == GGML_METAL_FUSION_FULL && dst->data == nullptr)) {
+            return false;
+        }
+    }
+
+    // SET_ROWS: one of K (offset o_k), one of V (offset o_v), (Hn*Dh, T) contiguous f32 rows, I64 row ids
+    bool has_k = false, has_v = false;
+    ggml_type kv_type = GGML_TYPE_COUNT;
+    for (int j = 2; j < 4; ++j) {
+        const ggml_tensor * sr  = nodes[j];
+        const ggml_tensor * src = sr->src[0];
+        const ggml_tensor * ids = sr->src[1];
+        if (sr->op != GGML_OP_SET_ROWS || (sr->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+            src->view_src != prep || src->type != GGML_TYPE_F32 ||
+            src->ne[0] != Hn*Dh || src->ne[1] != T || src->ne[2] != 1 || src->ne[3] != 1 ||
+            src->nb[0] != f || src->nb[1] != (size_t) (Hn*Dh)*f) {
+            return false;
+        }
+        if (ids->type != GGML_TYPE_I64 || ids->ne[0] != T || ggml_nelements(ids) != T || !ggml_is_contiguous(ids)) {
+            return false;
+        }
+        if ((sr->type != GGML_TYPE_F16 && sr->type != GGML_TYPE_F32) || sr->ne[0] != Hn*Dh ||
+            sr->nb[0] != ggml_type_size(sr->type) || sr->ne[2] != 1 || sr->ne[3] != 1 ||
+            (kv_type != GGML_TYPE_COUNT && sr->type != kv_type)) {
+            return false;
+        }
+        kv_type = sr->type;
+        if (src->view_offs == o_k && !has_k) {
+            has_k = true;
+        } else if (src->view_offs == o_v && !has_v) {
+            has_v = true;
+        } else {
+            return false;
+        }
+        if (mode == GGML_METAL_FUSION_FULL && sr->data == nullptr) {
+            return false;
+        }
+    }
+
+    return has_k && has_v;
+}
+
+// MAMBA3_MIMO + CPY: the trailing cpy scatters the new packed state (the tail of the op result)
+// into the recurrent cache, so the kernels write it straight to the cache and the cpy is elided.
+// same structure as the gdn + cache cpy fusion above: the op output has other consumers (the y
+// view), so the structural checks live entirely in this callback (unsafe = true)
+static bool ggml_metal_fusion_check_mamba3_cache(
+        const ggml_metal_fusion      * fusion,
+        const ggml_tensor * const    * nodes,
+        const ggml_cgraph            * gf,
+        const int                    * node_idxs,
+              int                      idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(fusion);
+    GGML_UNUSED(gf);
+    GGML_UNUSED(node_idxs);
+    GGML_UNUSED(idx);
+
+    const ggml_tensor * m3  = nodes[0];
+    const ggml_tensor * cpy = nodes[1];
+
+    // the kernels skip the state tail, so the op output must not be a graph output
+    if (m3->type != GGML_TYPE_F32 || (m3->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+
+    if (cpy->op != GGML_OP_CPY || (cpy->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+
+    const int64_t D_v      = m3->src[4]->ne[0];
+    const int64_t H        = m3->src[4]->ne[2];
+    const int64_t n_tok    = m3->src[0]->ne[1];
+    const int64_t n_embd_s = m3->src[7]->ne[0];
+    const int64_t n_seqs   = m3->src[7]->ne[1];
+    const size_t  tail_off = ggml_row_size(GGML_TYPE_F32, D_v*H*n_tok);
+
+    const ggml_tensor * src = cpy->src[0]; // state tail view
+    const ggml_tensor * dst = cpy->src[1]; // cache view
+
+    // src must be the whole state tail of this op (contiguous, at the tail offset)
+    if (src->op != GGML_OP_VIEW || src->view_src != m3 || src->view_offs != tail_off ||
+        src->type != GGML_TYPE_F32 || !ggml_is_contiguous(src) ||
+        src->ne[0] != n_embd_s || ggml_nelements(src) != n_embd_s*n_seqs) {
+        return false;
+    }
+
+    // dst: (n_embd_s, n_seqs) f32 rows, any (non-overlapping) row stride
+    const int64_t expected_ne[GGML_MAX_DIMS] = { n_embd_s, n_seqs, 1, 1 };
+    if (dst->type != GGML_TYPE_F32 ||
+        !std::equal(expected_ne, expected_ne + GGML_MAX_DIMS, dst->ne) ||
+        dst->nb[0] != ggml_type_size(GGML_TYPE_F32) ||
+        dst->nb[1] % sizeof(float) != 0 ||
+        dst->nb[1] < ggml_row_size(GGML_TYPE_F32, n_embd_s)) {
+        return false;
+    }
+
+    if (mode == GGML_METAL_FUSION_FULL) {
+        // the cache must be allocated so the kernel can write straight to its buffer
+        if (dst->data == nullptr) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 // MUL + SIN + SQR + MUL + ADD (snake activation)
 static bool ggml_metal_fusion_check_snake(
         const ggml_metal_fusion       * fusion,
@@ -830,6 +985,9 @@ static const std::vector<ggml_op> ops_snake = { GGML_OP_MUL, GGML_OP_SIN, GGML_O
 
 static const std::vector<ggml_op> ops_gdn_cache = { GGML_OP_GATED_DELTA_NET, GGML_OP_CPY };
 
+static const std::vector<ggml_op> ops_mamba3_cache = { GGML_OP_MAMBA3_MIMO, GGML_OP_CPY };
+static const std::vector<ggml_op> ops_tpa_prep_cache = { GGML_OP_OLALA_TPA_PREP, GGML_OP_CPY, GGML_OP_SET_ROWS, GGML_OP_SET_ROWS };
+
 static const std::vector<ggml_op> ops_ssm_conv_silu = { GGML_OP_SSM_CONV, GGML_OP_UNARY };
 
 static const std::vector<ggml_op> ops_moe_reduce_2 = {
@@ -880,6 +1038,10 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_SNAKE, ops_snake, {}, false, ggml_metal_fusion_check_snake },
 
     { GGML_METAL_FUSION_GDN_CACHE, ops_gdn_cache, {}, true, ggml_metal_fusion_check_gdn_cache },
+
+    { GGML_METAL_FUSION_MAMBA3_CACHE, ops_mamba3_cache, {}, true, ggml_metal_fusion_check_mamba3_cache },
+
+    { GGML_METAL_FUSION_TPA_PREP_CACHE, ops_tpa_prep_cache, {}, true, ggml_metal_fusion_check_tpa_prep_cache },
 
     { GGML_METAL_FUSION_TOPK_MOE, ops_topk_moe,                     {1}, true, ggml_metal_fusion_check_topk_moe },
     { GGML_METAL_FUSION_TOPK_MOE, ops_topk_moe_scale,               {1}, true, ggml_metal_fusion_check_topk_moe },
