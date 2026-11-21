@@ -1860,9 +1860,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 &&
                 op->type         == GGML_TYPE_F32 &&
-                op->src[0]->ne[0] == 24 &&
+                ((op->src[0]->ne[0] == 24 && op->src[2]->ne[0] == 24) ||
+                 (op->src[0]->ne[0] ==  8 && op->src[2]->ne[0] ==  8 && ggml_get_op_params_f32(op, 0) == 0.0f)) &&
                 op->src[1]->ne[0] >= 3 &&
-                op->src[2]->ne[0] == 24 &&
                 ggml_is_contiguous_rows(op->src[0]) &&
                 ggml_is_contiguous_rows(op->src[1]) &&
                 ggml_is_contiguous_rows(op->src[2]);
@@ -1880,13 +1880,14 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 op->src[2]->type == GGML_TYPE_F32 &&
                 (op->src[3] == NULL || op->src[3]->type == GGML_TYPE_F32) &&
                 op->type         == GGML_TYPE_F32 &&
-                op->src[1]->ne[1] == 4 &&
-                op->src[2]->ne[0] == 4 &&
-                (op->src[3] == NULL || (op->src[3]->ne[0] == 4 && op->src[3]->ne[1] == 4)) &&
                 ggml_is_contiguous_rows(op->src[0]) &&
                 ggml_is_contiguous_rows(op->src[1]) &&
                 ggml_is_contiguous_rows(op->src[2]) &&
-                (op->src[3] == NULL || ggml_is_contiguous_rows(op->src[3]));
+                // four streams read the mixing matrix by rows, two (SenseNova Loop's, transposed) through its strides
+                ((op->src[1]->ne[1] == 4 && op->src[2]->ne[0] == 4 &&
+                  (op->src[3] == NULL || (op->src[3]->ne[0] == 4 && op->src[3]->ne[1] == 4 && ggml_is_contiguous_rows(op->src[3])))) ||
+                 (op->src[1]->ne[1] == 2 && op->src[2]->ne[0] == 2 &&
+                  (op->src[3] == NULL || (op->src[3]->ne[0] == 2 && op->src[3]->ne[1] == 2))));
         case GGML_OP_TOP_K_MASK:
             return (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32) &&
                 op->src[0]->type == op->type &&
