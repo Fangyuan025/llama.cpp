@@ -2929,7 +2929,8 @@ struct llama_model_sensenova_loop : public llama_model_qwen35 {
             mix[2] = ggml_sigmoid(ctx, ggml_neg(ctx, a));
             mix[3] = ggml_sigmoid(ctx, ggml_neg(ctx, b));
         }
-        ggml_tensor * build_merge(ggml_tensor * residual, ggml_tensor * branch, const routing & route);
+        ggml_tensor * build_merge(ggml_tensor * residual, ggml_tensor * branch, const routing & route, int il);
+        ggml_tensor * unit_scale = nullptr;
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
