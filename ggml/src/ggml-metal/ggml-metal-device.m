@@ -1555,6 +1555,11 @@ void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t
     }
 }
 
+// the expert counts the map kernel of the expert matrix-matrix product is built for (kernel_mul_mm_id_map0_ne20_*)
+static bool ggml_metal_has_mm_id_map0(int64_t ne20) {
+    return (ne20 >= 1 && ne20 <= 16) || ne20 == 22 || ne20 == 24 || ne20 == 32;
+}
+
 static bool ggml_metal_supports_mul_mat_src1_prec(const struct ggml_tensor * op, bool has_tensor, bool has_bfloat, bool mm_path) {
     const enum ggml_prec prec = ggml_prec_get_src(op, 1);
 
@@ -2115,6 +2120,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_MUL_MAT_ID:
             if (!ggml_metal_supports_mul_mat_src1_prec(op, dev->props.has_tensor, dev->props.has_bfloat,
                     ggml_metal_op_mul_mat_id_use_mm(op, has_simdgroup_mm))) {
+                return false;
+            }
+            if (ggml_metal_op_mul_mat_id_use_mm(op, has_simdgroup_mm) && !ggml_metal_has_mm_id_map0(op->src[2]->ne[0])) {
                 return false;
             }
             return ggml_metal_supports_mul_mat_op(
