@@ -1382,6 +1382,14 @@ struct mtmd_context {
             case PROJECTOR_TYPE_DEEPSEEKOCR2:
                 {
                     img_end = "\n"; // prevent empty batch on llama-server
+                    if (text_model) {
+                        // Unlimited-OCR-2 derives its page boundaries from the exact "<PAGE><image>..." token stream
+                        char arch[64] = {0};
+                        llama_model_meta_val_str(text_model, "general.architecture", arch, sizeof(arch));
+                        if (std::string(arch) == "unlimited-ocr2") {
+                            img_end = "";
+                        }
+                    }
                     image_preproc = std::make_unique<mtmd_image_preprocessor_deepseekocr>(models.v.get());
                     ov_img_first = false;
                 } break;
