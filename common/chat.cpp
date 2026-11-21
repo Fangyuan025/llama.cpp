@@ -1386,6 +1386,15 @@ static common_chat_params_init_fn common_chat_template_detect_params_init(const 
         return common_chat_params_init_harmony_xml;
     }
 
+    // Olala 7A1B - <|channel_start|>NAME<|content|>...<|channel_end|> channels with
+    // XML-wrapped JSON tool calls. Checked before GPT-OSS, whose markers are <|channel|>/<|message|>.
+    if (src.find("<|channel_start|>") != std::string::npos &&
+        src.find("<|channel_end|>") != std::string::npos &&
+        src.find("<toolcalls>") != std::string::npos) {
+        LOG_DBG("Using specialized template: Olala\n");
+        return common_chat_params_init_olala;
+    }
+
     // GPT-OSS - has unique channel-based structure that needs dedicated handler
     if (src.find("<|channel|>") != std::string::npos) {
         LOG_DBG("Using specialized template: GPT-OSS\n");

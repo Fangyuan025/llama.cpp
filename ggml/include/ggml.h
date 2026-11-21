@@ -415,6 +415,14 @@ extern "C" {
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
         GGML_OP_TOP_K_MASK,
+        GGML_OP_MAMBA3_MIMO,
+        GGML_OP_GEODESIC,
+        GGML_OP_OLALA_MOE,
+        GGML_OP_OLALA_MMV,
+        GGML_OP_OLALA_TPA_PREP,
+        GGML_OP_OLALA_DIFF_GATE,
+        GGML_OP_OLALA_TPA_ATTN,
+        GGML_OP_OLALA_TPA_EXPAND,
 
         GGML_OP_UNARY,
 
@@ -2560,6 +2568,179 @@ extern "C" {
             struct ggml_tensor  * score,
             struct ggml_tensor  * blocks,
             struct ggml_tensor  * extra);
+
+    // Olala Mamba3-MIMO mixer core, raw-projection form. Per head h and
+    // token t (sequence-major tokens, equal count per sequence):
+    //   k_r = rot(rmsnorm(B_r)*w_b + b_bias_r),  q_r = rot(rmsnorm(C_r)*w_c + c_bias_r)
+    //   v_r = x * mimo_x_r,                       z_r = z * mimo_z_r
+    //   dt  = softplus(dt_raw + dt_bias), a = min(-softplus(A_raw), -a_floor)
+    //   alpha = exp(a*dt), trap = sigmoid(trap_raw)
+    //   beta = (1-trap)*dt*alpha, gamma = trap*dt
+    //   ang += tanh(ang_raw)*pi*dt (kept wrapped to [-pi, pi]); rot() rotates the
+    //   pairs (i, i + D_qk/2), i < D_qk/4, by ang_i
+    //   S   = alpha*S + beta*sum_r v_prev_r k_prev_r^T + gamma*sum_r v_r k_r^T
+    //   y   = sum_r mimo_o_r * (S q_r + D*v_r) * silu(z_r)
+    //
+    // pdyn:   (2*R*D_qk + D_qk/4, n_tok)  rows [B (D_qk,R) | C (D_qk,R) | ang_raw]
+    // pstat:  ((2*D_v + 3)*H, n_tok)     per head [z (D_v) | x (D_v) | dt | A | trap]
+    // bias:   (D_qk, 2*R, H)             [b_bias | c_bias]
+    // mxz:    (D_v,  2*R, H)             [mimo_x | mimo_z]
+    // mimo_o: (D_v,  R,   H)
+    // norms:  (D_qk, 2)                  [w_b | w_c]
+    // misc:   (H, 2)                     [dt_bias | D]
+    // state:  (n_embd_s, n_seqs) packed per seq [S (D_qk,D_v,H) | k_prev (D_qk,R,H)
+    //          | v_prev (D_v,R,H) | ang (D_qk/4,H)]
+    // result: 1-D, y (D_v, H, n_tok) followed by the new state (n_embd_s, n_seqs)
+    GGML_API struct ggml_tensor * ggml_mamba3_mimo(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * pdyn,
+            struct ggml_tensor  * pstat,
+            struct ggml_tensor  * bias,
+            struct ggml_tensor  * mxz,
+            struct ggml_tensor  * mimo_o,
+            struct ggml_tensor  * norms,
+            struct ggml_tensor  * misc,
+            struct ggml_tensor  * state,
+            float                 eps,
+            float                 a_floor);
+
+    // same, updating the state in place in the recurrent cache (CPU backend):
+    // states = the whole cache (n_embd_s, n_rows), ids = I32 source row of each
+    // of the n_seqs sequences, state_dst = their destination rows (n_embd_s,
+    // n_seqs view of the cache). result: y only, (D_v, H, n_tok) flattened.
+    GGML_API struct ggml_tensor * ggml_mamba3_mimo_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * pdyn,
+            struct ggml_tensor  * pstat,
+            struct ggml_tensor  * bias,
+            struct ggml_tensor  * mxz,
+            struct ggml_tensor  * mimo_o,
+            struct ggml_tensor  * norms,
+            struct ggml_tensor  * misc,
+            struct ggml_tensor  * states,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * state_dst,
+            float                 eps,
+            float                 a_floor);
+
+    // Olala geodesic residual, per row of x and g (n_embd, n_rows):
+    //   g_perp = g - (x.g / |x|^2) x
+    //   theta  = min((min(|g_perp|/|x|, pi/4) * scale + bias) * inv_depth, pi/4)
+    //   out    = x cos(theta) + (g_perp/|g_perp|) |x| sin(theta)
+    // scale, bias: 1-element f32 tensors
+    GGML_API struct ggml_tensor * ggml_geodesic(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * scale,
+            struct ggml_tensor  * bias,
+            float                 inv_depth);
+
+
+    // Olala latent MoE block, fused (CPU backend). x: (n_embd, T) f32.
+    //   lat    = w_lat_down^T x                                        (n_lat, T)
+    //   logits = w_router^T x (f32); sel = top-k of sigmoid(logits) + router_bias
+    //   w_k    = sigmoid(logits[sel_k]) / max(sum_k sigmoid(logits[sel_k]), 2^-14) * w_scale
+    //   routed = w_lat_up^T sum_k w_k * (w_down_exps[sel_k]^T relu(w_up_exps[sel_k]^T lat)^2)
+    //   out    = routed + w_down_sh^T relu(w_up_sh^T x)^2                 (n_embd, T)
+    GGML_API struct ggml_tensor * ggml_olala_moe(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * w_lat_down,   // (n_embd, n_lat)
+            struct ggml_tensor  * w_router,     // (n_embd, n_expert) f32
+            struct ggml_tensor  * router_bias,  // (n_expert) f32
+            struct ggml_tensor  * w_up_exps,    // (n_lat, n_ff, n_expert)
+            struct ggml_tensor  * w_down_exps,  // (n_ff, n_lat, n_expert)
+            struct ggml_tensor  * w_lat_up,     // (n_lat, n_embd)
+            struct ggml_tensor  * w_up_sh,      // (n_embd, n_ff_sh)
+            struct ggml_tensor  * w_down_sh,    // (n_ff_sh, n_embd)
+            int                   n_expert_used,
+            float                 w_scale,
+            int                   expert_cache_mib); // < 0: expert weights are resident.
+                                                     // >= 0 (CPU): they are a file mapping read
+                                                     // on demand; the selected experts are
+                                                     // prefetched after routing and released
+                                                     // after use, keeping at most this many MiB
+                                                     // of recently used experts resident
+
+    // Olala V-layer helpers (decode kernels; Metal + CPU reference)
+    //   y = concat_i(W_i^T x) for up to 9 weight matrices sharing the input x (n_embd, T) f32 -> (sum_i rows_i, T) f32
+    GGML_API struct ggml_tensor * ggml_olala_mmv(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor ** ws,
+            int                   n_ws);
+
+    //   attention preparation of the Olala V-layer (semantic reference: ggml_compute_forward_olala_tpa_prep_f32):
+    //   pr (ROW, T) f32 = [q (H*Dh) | A_k (Hn*R) | A_v (Hn*R) | B_k (R*Dh) | B_v (R*Dh) | sh_k (Hn) | sh_v (Hn) | lam (Hn) | g (Hs*Dh)]
+    //   prev (2*Hn*Dh, n_seqs) f32 = [K_prev | V_prev] per sequence, pos (T) i32, q_norm / k_norm (Dh), scaler (H)
+    //   out: flat f32 [q (Dh,H,T) normed+scaled | k (Dh,Hn,T) shifted+normed | v (Dh,Hn,T) shifted | lam (Hn,T) sigmoid |
+    //        gs (Hs*Dh,T) silu(g + gate_b) | kvlast (2*Hn*Dh, n_seqs) pre-shift K/V of each sequence's last token]
+    GGML_API struct ggml_tensor * ggml_olala_tpa_prep(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * pr,
+            struct ggml_tensor  * prev,
+            struct ggml_tensor  * pos,
+            struct ggml_tensor  * q_norm,
+            struct ggml_tensor  * k_norm,
+            struct ggml_tensor  * scaler,
+            int H, int Hn, int R, int Dh, int Hs, int n_seqs,
+            float eps, float wsize, float gate_b);
+
+    //   factored variant (the KV cache keeps the TPA factors instead of the expanded K/V): same inputs, out: flat f32
+    //   [q~ (Dh,H,T) normed+scaled, times k_norm | krow (KR,T) | vrow (VR,T) | lam | gs | kvlast] with
+    //   krow = [B_k (R*Dh) | A_k (Hn*R) | ck (Hn) | ak (Hn) | 0 pad], vrow = [B_v (R*Dh) | A_v (Hn*R) | av (Hn) | 0 pad],
+    //   ck = 1/(R*rms(shifted raw K)), ak / av the token-shift weights (0 at position 0), KR / VR multiples of Hn
+    //   (ggml_olala_tpa_row_k / ggml_olala_tpa_row_v); see ggml_olala_tpa_attn for how the rows are read back
+    GGML_API struct ggml_tensor * ggml_olala_tpa_prep_factored(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * pr,
+            struct ggml_tensor  * prev,
+            struct ggml_tensor  * pos,
+            struct ggml_tensor  * q_norm,
+            struct ggml_tensor  * k_norm,
+            struct ggml_tensor  * scaler,
+            int H, int Hn, int R, int Dh, int Hs, int n_seqs,
+            float eps, float wsize, float gate_b);
+
+    GGML_API int64_t ggml_olala_tpa_row_k(int Hn, int R, int Dh);
+    GGML_API int64_t ggml_olala_tpa_row_v(int Hn, int R, int Dh);
+
+    //   attention over a factored Olala TPA cache (semantic reference: ggml_compute_forward_olala_tpa_attn_f32):
+    //   q (Dh, H, T, n_stream) f32 (q~ of ggml_olala_tpa_prep_factored), k (KR, n_kv, n_stream) / v (VR, n_kv, n_stream)
+    //   rows of the cache, mask (n_kv, T_pad >= T, 1, n_stream) f16/f32, prev (n_kv, n_stream) i32 = cell of the previous
+    //   token of the same sequence (-1: none). For kv head g = h/(H/Hn), cell c, p = prev[c]:
+    //     K[c] = ck[c,g]*((1-ak[c,g])*sum_r A_k[c,g,r]*B_k[c,r] + ak[c,g]*sum_r A_k[p,g,r]*B_k[p,r])   (k_norm is in q~)
+    //     V[c] = ((1-av[c,g])*sum_r A_v[c,g,r]*B_v[c,r] + av[c,g]*sum_r A_v[p,g,r]*B_v[p,r])/R
+    //     out[h,t] = softmax_c(softcap*tanh(scale*q[h,t].K[c]/softcap) + mask[c,t]) . V      (softcap 0: no tanh)
+    //   -> (Dh, H, T, n_stream) f32
+    GGML_API struct ggml_tensor * ggml_olala_tpa_attn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * prev,
+            int Hn, int R,
+            float scale, float softcap);
+
+    //   expanded K (is_v = false) or V of a factored Olala TPA cache, for the attention of long batches:
+    //   rows (KR or VR, n_kv, n_stream), prev (n_kv, n_stream) -> (Dh, Hn, n_kv, n_stream) f16, K[c] / V[c] as in
+    //   ggml_olala_tpa_attn (K without the k_norm weight, which is in q~)
+    GGML_API struct ggml_tensor * ggml_olala_tpa_expand(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * rows,
+            struct ggml_tensor  * prev,
+            int Hn, int R, int Dh,
+            bool is_v);
+
+    //   differential combine + gate: attn (Dh, H, T), lam (Hn, T), gs (Hs*Dh, T) -> (Hs*Dh, T)
+    //   out[(hn*snr+i)*Dh+d] = (attn[(hn*(snr+1)+i)*Dh+d] - lam[hn]*attn[(hn*(snr+1)+snr)*Dh+d]) * gs[(hn*snr+i)*Dh+d]
+    GGML_API struct ggml_tensor * ggml_olala_diff_gate(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * attn,
+            struct ggml_tensor  * lam,
+            struct ggml_tensor  * gs);
 
     // custom operators
 

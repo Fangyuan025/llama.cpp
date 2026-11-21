@@ -260,6 +260,10 @@ public:
             const llama_ubatch * ubatch, const slot_info & sinfo, uint32_t kpool, uint32_t n_kv) const;
     void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
 
+    // I32 (n_kv, n_stream): for each cell, the cell of the previous position of the same sequence (-1: none), for
+    // attention layers whose keys depend on the previous token (Olala TPA factored cache)
+    void set_input_prev_cell(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+
     // true if llama_kv_cell_ext holds information that has to survive a state save/restore
     bool has_cell_ext() const;
 
@@ -466,6 +470,10 @@ public:
     void set_input_kpool(ggml_tensor * pool_idxs, ggml_tensor * pool_pos, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
             const llama_ubatch * ubatch, uint32_t kpool) const;
     void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
+
+    // I32 (n_kv, n_stream): for each cell, the cell of the previous position of the same sequence (-1: none), for
+    // attention layers whose keys depend on the previous token (Olala TPA factored cache)
+    void set_input_prev_cell(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     // see llama_kv_cache::get_prev_tokens()
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;

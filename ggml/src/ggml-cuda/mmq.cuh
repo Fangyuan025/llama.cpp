@@ -1729,3 +1729,6 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 
 // prec_requested: the src1 precision requested by the fused MUL_MATs.
 bool ggml_cuda_mmq_fusion_is_efficient(ggml_type type, ggml_prec prec_requested, int64_t nrows_x, int64_t ncols, int64_t nchannels, int device);
+
+// [TAG_GGML_PREC] true if MMQ keeps the src1 scales in fp32 for this type (D4 layout). The other layouts and MMVQ use fp16 scales.
+bool ggml_cuda_mmq_has_f32_scale(enum ggml_type type);

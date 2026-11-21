@@ -21,6 +21,12 @@ target_link_libraries(ggml-metal PRIVATE
                       ${METALKIT_FRAMEWORK}
                       )
 
+# GPU core count (IOKit, macOS only)
+if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    find_library(IOKIT_FRAMEWORK IOKit REQUIRED)
+    target_link_libraries(ggml-metal PRIVATE ${IOKIT_FRAMEWORK})
+endif()
+
 if (GGML_METAL_NDEBUG)
     add_compile_definitions(GGML_METAL_NDEBUG)
 endif()
@@ -67,6 +73,7 @@ set(METALLIB_KERNEL_SOURCES
     kernels/ssm.metal
     kernels/wkv.metal
     kernels/gated_delta_net.metal
+    kernels/mamba3.metal
     kernels/solve_tri.metal
     kernels/rope.metal
     kernels/conv.metal

@@ -39,6 +39,7 @@ struct llama_cparams {
     bool causal_attn;
     bool offload_kqv;
     bool flash_attn;
+    bool tpa_factored; // TPA attention layers keep the TPA factors in the KV cache (llama_tpa_cache_type)
     bool auto_fa;
     bool fused_dsv4_hc_pre;
     bool fused_dsv4_hc_comb;

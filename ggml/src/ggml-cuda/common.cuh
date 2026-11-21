@@ -1594,3 +1594,13 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
 }
+
+// [TAG_GGML_PREC] src1 must not go below bf16 (activations beyond the half range): do not use the kernels with fp16
+// scales (ggml-cuda.cu and fusion.cu both ask)
+static inline bool ggml_cuda_mul_mat_src1_wide(const ggml_tensor * src0, const ggml_tensor * dst) {
+    if (!ggml_is_quantized(src0->type)) {
+        return false;
+    }
+    const ggml_prec prec = ggml_prec_get_src(dst, 1);
+    return prec == GGML_PREC_F32 || prec == GGML_PREC_BF16;
+}

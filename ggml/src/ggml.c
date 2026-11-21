@@ -1099,6 +1099,14 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
     "TOP_K_MASK",
+    "MAMBA3_MIMO",
+    "GEODESIC",
+    "OLALA_MOE",
+    "OLALA_MMV",
+    "OLALA_TPA_PREP",
+    "OLALA_DIFF_GATE",
+    "OLALA_TPA_ATTN",
+    "OLALA_TPA_EXPAND",
 
     "UNARY",
 
@@ -1120,7 +1128,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SIGMOID_BACK",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 109, "GGML_OP_COUNT != 109");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1216,6 +1224,14 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
     "top_k_mask(mask, top_k, score, blocks, extra)",
+    "mamba3_mimo(pdyn, pstat, ..., s)",
+    "geodesic(x, g)",
+    "olala_moe(x, ...)",
+    "olala_mmv(x, w...)",
+    "olala_tpa_prep(pr, ...)",
+    "olala_diff_gate(attn, lam, gs)",
+    "olala_tpa_attn(q, k, v, mask, prev)",
+    "olala_tpa_expand(rows, prev)",
 
     "unary(x)",
 
@@ -1237,7 +1253,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sigmoid_back(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 109, "GGML_OP_COUNT != 109");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6724,6 +6740,407 @@ struct ggml_tensor * ggml_top_k_mask(
     result->src[2] = score;
     result->src[3] = blocks;
     result->src[4] = extra;
+
+    return result;
+}
+
+// ggml_mamba3_mimo
+
+struct ggml_tensor * ggml_mamba3_mimo(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * pdyn,
+        struct ggml_tensor  * pstat,
+        struct ggml_tensor  * bias,
+        struct ggml_tensor  * mxz,
+        struct ggml_tensor  * mimo_o,
+        struct ggml_tensor  * norms,
+        struct ggml_tensor  * misc,
+        struct ggml_tensor  * state,
+        float                 eps,
+        float                 a_floor) {
+    struct ggml_tensor * srcs[8] = { pdyn, pstat, bias, mxz, mimo_o, norms, misc, state };
+    for (int i = 0; i < 8; ++i) {
+        GGML_ASSERT(srcs[i]->type == GGML_TYPE_F32);
+    }
+    GGML_ASSERT(ggml_is_contiguous_rows(pdyn) && ggml_is_contiguous_rows(pstat));
+    for (int i = 2; i < 8; ++i) {
+        GGML_ASSERT(ggml_is_contiguous(srcs[i]));
+    }
+
+    const int64_t D_qk  = bias->ne[0];
+    const int64_t R     = mimo_o->ne[1];
+    const int64_t H     = mimo_o->ne[2];
+    const int64_t D_v   = mimo_o->ne[0];
+    const int64_t n_ang = D_qk / 4;
+    const int64_t n_tok = pdyn->ne[1];
+
+    GGML_ASSERT(D_qk % 4 == 0);
+    GGML_ASSERT(bias->ne[1] == 2*R && bias->ne[2] == H);
+    GGML_ASSERT(mxz->ne[0] == D_v && mxz->ne[1] == 2*R && mxz->ne[2] == H);
+    GGML_ASSERT(norms->ne[0] == D_qk && norms->ne[1] == 2);
+    GGML_ASSERT(misc->ne[0] == H && misc->ne[1] == 2);
+    GGML_ASSERT(pdyn->ne[0] == 2*R*D_qk + n_ang);
+    GGML_ASSERT(pstat->ne[0] == (2*D_v + 3)*H && pstat->ne[1] == n_tok);
+
+    const int64_t n_embd_s = H*D_v*D_qk + H*R*D_qk + H*R*D_v + H*n_ang;
+    GGML_ASSERT(state->ne[0] == n_embd_s);
+    const int64_t n_seqs = state->ne[1];
+    GGML_ASSERT(n_seqs >= 1 && n_tok % n_seqs == 0);
+
+    const int64_t ne[1] = { D_v*H*n_tok + n_embd_s*n_seqs };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 1, ne);
+
+    float params[2] = { eps, a_floor };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op = GGML_OP_MAMBA3_MIMO;
+    for (int i = 0; i < 8; ++i) {
+        result->src[i] = srcs[i];
+    }
+
+    return result;
+}
+
+struct ggml_tensor * ggml_mamba3_mimo_inplace(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * pdyn,
+        struct ggml_tensor  * pstat,
+        struct ggml_tensor  * bias,
+        struct ggml_tensor  * mxz,
+        struct ggml_tensor  * mimo_o,
+        struct ggml_tensor  * norms,
+        struct ggml_tensor  * misc,
+        struct ggml_tensor  * states,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * state_dst,
+        float                 eps,
+        float                 a_floor) {
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ggml_nelements(ids) == state_dst->ne[1]);
+    GGML_ASSERT(states->type == GGML_TYPE_F32 && state_dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(states->ne[0] == state_dst->ne[0]);
+    GGML_ASSERT(states->nb[0] == sizeof(float) && state_dst->nb[0] == sizeof(float));
+
+    struct ggml_tensor * srcs[7] = { pdyn, pstat, bias, mxz, mimo_o, norms, misc };
+    for (int i = 0; i < 7; ++i) {
+        GGML_ASSERT(srcs[i]->type == GGML_TYPE_F32);
+    }
+    const int64_t D_qk = bias->ne[0], R = mimo_o->ne[1], H = mimo_o->ne[2], D_v = mimo_o->ne[0];
+    const int64_t n_tok = pdyn->ne[1];
+    GGML_ASSERT(pdyn->ne[0] == 2*R*D_qk + D_qk/4 && pstat->ne[0] == (2*D_v + 3)*H && pstat->ne[1] == n_tok);
+    GGML_ASSERT(state_dst->ne[0] == H*D_v*D_qk + H*R*D_qk + H*R*D_v + H*(D_qk/4));
+    GGML_ASSERT(n_tok % state_dst->ne[1] == 0);
+
+    const int64_t ne[1] = { D_v*H*n_tok };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 1, ne);
+
+    float params[2] = { eps, a_floor };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op = GGML_OP_MAMBA3_MIMO;
+    for (int i = 0; i < 7; ++i) {
+        result->src[i] = srcs[i];
+    }
+    result->src[7] = states;
+    result->src[8] = ids;
+    result->src[9] = state_dst;
+
+    return result;
+}
+
+// ggml_geodesic
+
+struct ggml_tensor * ggml_geodesic(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * scale,
+        struct ggml_tensor  * bias,
+        float                 inv_depth) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && g->type == GGML_TYPE_F32);
+    GGML_ASSERT(scale->type == GGML_TYPE_F32 && bias->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_nelements(scale) == 1 && ggml_nelements(bias) == 1);
+    GGML_ASSERT(ggml_are_same_shape(x, g));
+    GGML_ASSERT(ggml_is_contiguous_rows(x) && ggml_is_contiguous_rows(g));
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, x->ne);
+
+    ggml_set_op_params_f32(result, 0, inv_depth);
+
+    result->op     = GGML_OP_GEODESIC;
+    result->src[0] = x;
+    result->src[1] = g;
+    result->src[2] = scale;
+    result->src[3] = bias;
+
+    return result;
+}
+
+
+// ggml_olala_mmv
+
+struct ggml_tensor * ggml_olala_mmv(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor ** ws,
+        int                   n_ws) {
+    GGML_ASSERT(n_ws >= 1 && n_ws <= GGML_MAX_SRC - 1);
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && ggml_is_contiguous(x));
+    GGML_ASSERT(x->ne[2] == 1 && x->ne[3] == 1);
+
+    int64_t rows = 0;
+    for (int i = 0; i < n_ws; ++i) {
+        GGML_ASSERT(ws[i] != NULL && ggml_is_contiguous(ws[i]));
+        GGML_ASSERT(ws[i]->ne[0] == x->ne[0] && ws[i]->ne[2] == 1 && ws[i]->ne[3] == 1);
+        rows += ws[i]->ne[1];
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rows, x->ne[1]);
+
+    result->op     = GGML_OP_OLALA_MMV;
+    result->src[0] = x;
+    for (int i = 0; i < n_ws; ++i) {
+        result->src[1 + i] = ws[i];
+    }
+
+    return result;
+}
+
+// ggml_olala_tpa_prep
+
+int64_t ggml_olala_tpa_row_k(int Hn, int R, int Dh) {
+    // [B_k (R*Dh) | A_k (Hn*R) | ck (Hn) | ak (Hn)], padded to a multiple of Hn
+    const int64_t n = (int64_t) R*Dh + (int64_t) Hn*R + 2*Hn;
+    return (n + Hn - 1)/Hn*Hn;
+}
+
+int64_t ggml_olala_tpa_row_v(int Hn, int R, int Dh) {
+    // [B_v (R*Dh) | A_v (Hn*R) | av (Hn)], padded to a multiple of Hn
+    const int64_t n = (int64_t) R*Dh + (int64_t) Hn*R + Hn;
+    return (n + Hn - 1)/Hn*Hn;
+}
+
+static struct ggml_tensor * ggml_olala_tpa_prep_impl(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * pr,
+        struct ggml_tensor  * prev,
+        struct ggml_tensor  * pos,
+        struct ggml_tensor  * q_norm,
+        struct ggml_tensor  * k_norm,
+        struct ggml_tensor  * scaler,
+        int H, int Hn, int R, int Dh, int Hs, int n_seqs,
+        float eps, float wsize, float gate_b, bool factored) {
+    GGML_ASSERT(pr->type == GGML_TYPE_F32 && prev->type == GGML_TYPE_F32 && pos->type == GGML_TYPE_I32);
+    GGML_ASSERT(q_norm->type == GGML_TYPE_F32 && k_norm->type == GGML_TYPE_F32 && scaler->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(pr) && ggml_is_contiguous_rows(prev) && ggml_is_contiguous(pos));
+    GGML_ASSERT(H > 0 && Hn > 0 && H % Hn == 0 && R > 0 && Dh > 0 && Hs == H - Hn && n_seqs > 0);
+
+    const int64_t T   = pr->ne[1];
+    const int64_t ROW = (int64_t) H*Dh + 2*Hn*R + 2*R*Dh + 3*Hn + (int64_t) Hs*Dh;
+    GGML_ASSERT(pr->ne[0] == ROW);
+    GGML_ASSERT(prev->ne[0] == 2*Hn*Dh && prev->ne[1] == n_seqs);
+    GGML_ASSERT(pos->ne[0] == T && T % n_seqs == 0);
+    GGML_ASSERT(q_norm->ne[0] == Dh && k_norm->ne[0] == Dh && scaler->ne[0] == H);
+
+    const int64_t n_k = factored ? ggml_olala_tpa_row_k(Hn, R, Dh) : (int64_t) Hn*Dh;
+    const int64_t n_v = factored ? ggml_olala_tpa_row_v(Hn, R, Dh) : (int64_t) Hn*Dh;
+    const int64_t n = T*((int64_t) H*Dh + n_k + n_v + Hn + (int64_t) Hs*Dh) + (int64_t) n_seqs*2*Hn*Dh;
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+
+    int32_t params[10] = { H, Hn, R, Dh, Hs, n_seqs, 0, 0, 0, factored ? 1 : 0 };
+    memcpy(&params[6], &eps,    sizeof(float));
+    memcpy(&params[7], &wsize,  sizeof(float));
+    memcpy(&params[8], &gate_b, sizeof(float));
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_OLALA_TPA_PREP;
+    result->src[0] = pr;
+    result->src[1] = prev;
+    result->src[2] = pos;
+    result->src[3] = q_norm;
+    result->src[4] = k_norm;
+    result->src[5] = scaler;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_olala_tpa_prep(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * pr,
+        struct ggml_tensor  * prev,
+        struct ggml_tensor  * pos,
+        struct ggml_tensor  * q_norm,
+        struct ggml_tensor  * k_norm,
+        struct ggml_tensor  * scaler,
+        int H, int Hn, int R, int Dh, int Hs, int n_seqs,
+        float eps, float wsize, float gate_b) {
+    return ggml_olala_tpa_prep_impl(ctx, pr, prev, pos, q_norm, k_norm, scaler, H, Hn, R, Dh, Hs, n_seqs, eps, wsize, gate_b, false);
+}
+
+struct ggml_tensor * ggml_olala_tpa_prep_factored(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * pr,
+        struct ggml_tensor  * prev,
+        struct ggml_tensor  * pos,
+        struct ggml_tensor  * q_norm,
+        struct ggml_tensor  * k_norm,
+        struct ggml_tensor  * scaler,
+        int H, int Hn, int R, int Dh, int Hs, int n_seqs,
+        float eps, float wsize, float gate_b) {
+    return ggml_olala_tpa_prep_impl(ctx, pr, prev, pos, q_norm, k_norm, scaler, H, Hn, R, Dh, Hs, n_seqs, eps, wsize, gate_b, true);
+}
+
+// ggml_olala_tpa_attn
+
+struct ggml_tensor * ggml_olala_tpa_attn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * prev,
+        int Hn, int R,
+        float scale, float softcap) {
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && ggml_is_contiguous(q));
+    GGML_ASSERT(k->type == v->type && (k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_F32));
+    GGML_ASSERT(mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(prev->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous_rows(k) && ggml_is_contiguous_rows(v) && ggml_is_contiguous_rows(mask) && ggml_is_contiguous_rows(prev));
+
+    const int64_t Dh = q->ne[0];
+    const int64_t H  = q->ne[1];
+    const int64_t T  = q->ne[2];
+    const int64_t ns = q->ne[3];
+    const int64_t n_kv = k->ne[1];
+    GGML_ASSERT(Hn > 0 && H % Hn == 0 && R > 0);
+    GGML_ASSERT(k->ne[0] == ggml_olala_tpa_row_k(Hn, R, (int) Dh) && v->ne[0] == ggml_olala_tpa_row_v(Hn, R, (int) Dh));
+    GGML_ASSERT(v->ne[1] == n_kv && k->ne[2] == ns && v->ne[2] == ns);
+    GGML_ASSERT(mask->ne[0] == n_kv && mask->ne[1] >= T && mask->ne[3] == ns);
+    GGML_ASSERT(prev->ne[0] == n_kv && prev->ne[1] == ns);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, Dh, H, T, ns);
+
+    int32_t params[4] = { Hn, R, 0, 0 };
+    memcpy(&params[2], &scale,   sizeof(float));
+    memcpy(&params[3], &softcap, sizeof(float));
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_OLALA_TPA_ATTN;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = mask;
+    result->src[4] = prev;
+
+    return result;
+}
+
+// ggml_olala_tpa_expand
+
+struct ggml_tensor * ggml_olala_tpa_expand(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * rows,
+        struct ggml_tensor  * prev,
+        int Hn, int R, int Dh,
+        bool is_v) {
+    GGML_ASSERT(rows->type == GGML_TYPE_F16 || rows->type == GGML_TYPE_F32);
+    GGML_ASSERT(prev->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous_rows(rows) && ggml_is_contiguous_rows(prev));
+    GGML_ASSERT(rows->ne[0] == (is_v ? ggml_olala_tpa_row_v(Hn, R, Dh) : ggml_olala_tpa_row_k(Hn, R, Dh)));
+    GGML_ASSERT(prev->ne[0] == rows->ne[1] && prev->ne[1] == rows->ne[2]);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, Dh, Hn, rows->ne[1], rows->ne[2]);
+
+    int32_t params[3] = { Hn, R, is_v ? 1 : 0 };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_OLALA_TPA_EXPAND;
+    result->src[0] = rows;
+    result->src[1] = prev;
+
+    return result;
+}
+
+// ggml_olala_diff_gate
+
+struct ggml_tensor * ggml_olala_diff_gate(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * attn,
+        struct ggml_tensor  * lam,
+        struct ggml_tensor  * gs) {
+    GGML_ASSERT(attn->type == GGML_TYPE_F32 && lam->type == GGML_TYPE_F32 && gs->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(attn) && ggml_is_contiguous_rows(lam) && ggml_is_contiguous_rows(gs));
+
+    const int64_t Dh = attn->ne[0];
+    const int64_t H  = attn->ne[1];
+    const int64_t T  = attn->ne[2];
+    const int64_t Hn = lam->ne[0];
+    GGML_ASSERT(Hn > 0 && H % Hn == 0 && H/Hn >= 2);
+    const int64_t Hs = H - Hn;
+    GGML_ASSERT(lam->ne[1] == T && gs->ne[0] == Hs*Dh && gs->ne[1] == T);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, Hs*Dh, T);
+
+    result->op     = GGML_OP_OLALA_DIFF_GATE;
+    result->src[0] = attn;
+    result->src[1] = lam;
+    result->src[2] = gs;
+
+    return result;
+}
+
+// ggml_olala_moe
+
+struct ggml_tensor * ggml_olala_moe(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * w_lat_down,
+        struct ggml_tensor  * w_router,
+        struct ggml_tensor  * router_bias,
+        struct ggml_tensor  * w_up_exps,
+        struct ggml_tensor  * w_down_exps,
+        struct ggml_tensor  * w_lat_up,
+        struct ggml_tensor  * w_up_sh,
+        struct ggml_tensor  * w_down_sh,
+        int                   n_expert_used,
+        float                 w_scale,
+        int                   expert_cache_mib) {
+    struct ggml_tensor * srcs[9] = { x, w_lat_down, w_router, router_bias, w_up_exps, w_down_exps, w_lat_up, w_up_sh, w_down_sh };
+    for (int i = 0; i < 9; ++i) {
+        GGML_ASSERT(srcs[i] != NULL);
+        GGML_ASSERT(ggml_is_contiguous(srcs[i]));
+    }
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && w_router->type == GGML_TYPE_F32 && router_bias->type == GGML_TYPE_F32);
+
+    const int64_t n_embd   = x->ne[0];
+    const int64_t n_tok    = x->ne[1];
+    const int64_t n_lat    = w_lat_down->ne[1];
+    const int64_t n_expert = w_router->ne[1];
+    const int64_t n_ff     = w_up_exps->ne[1];
+    const int64_t n_ff_sh  = w_up_sh->ne[1];
+
+    GGML_ASSERT(x->ne[2] == 1 && x->ne[3] == 1);
+    GGML_ASSERT(w_lat_down->ne[0] == n_embd);
+    GGML_ASSERT(w_router->ne[0] == n_embd && router_bias->ne[0] == n_expert);
+    GGML_ASSERT(w_up_exps->ne[0] == n_lat && w_up_exps->ne[2] == n_expert);
+    GGML_ASSERT(w_down_exps->ne[0] == n_ff && w_down_exps->ne[1] == n_lat && w_down_exps->ne[2] == n_expert);
+    GGML_ASSERT(w_lat_up->ne[0] == n_lat && w_lat_up->ne[1] == n_embd);
+    GGML_ASSERT(w_up_sh->ne[0] == n_embd);
+    GGML_ASSERT(w_down_sh->ne[0] == n_ff_sh && w_down_sh->ne[1] == n_embd);
+    GGML_ASSERT(n_expert_used >= 1 && n_expert_used <= n_expert);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tok);
+
+    int32_t params[3];
+    params[0] = n_expert_used;
+    memcpy(&params[1], &w_scale, sizeof(float));
+    params[2] = expert_cache_mib;
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op = GGML_OP_OLALA_MOE;
+    for (int i = 0; i < 9; ++i) {
+        result->src[i] = srcs[i];
+    }
 
     return result;
 }

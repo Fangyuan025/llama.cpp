@@ -787,6 +787,191 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net(
     return res;
 }
 
+// true if the register-state fast path of kernels/mamba3.metal is instantiated for these dims
+static bool ggml_metal_mamba3_mimo_fast(int64_t D_qk, int64_t D_v, int64_t R) {
+    return D_qk == 128 && D_v == 64 && R == 4;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mamba3_mimo(ggml_metal_library_t lib, const ggml_tensor * op, ggml_metal_mamba3_mimo_kernel kernel, bool allow_fast) {
+    GGML_ASSERT(op->op == GGML_OP_MAMBA3_MIMO);
+
+    const int64_t D_qk  = op->src[2]->ne[0];
+    const int64_t R     = op->src[4]->ne[1];
+    const int64_t D_v   = op->src[4]->ne[0];
+    const int64_t n_ang = D_qk/4;
+
+    // allow_fast == false selects the generic kernels (state in device memory) even for the
+    // fast-path dims; both use the same workspace layout, so they can be mixed freely
+    const char * dims = allow_fast && ggml_metal_mamba3_mimo_fast(D_qk, D_v, R) ? "d128_v64_r4" : "gen";
+
+    char base[256];
+    char name[256];
+
+    bool main_kernel = true;
+
+    switch (kernel) {
+        case GGML_METAL_MAMBA3_MIMO_SERIAL:     snprintf(base, 256, "kernel_mamba3_mimo_serial_%s", dims); break;
+        case GGML_METAL_MAMBA3_MIMO_PHASE1:     snprintf(base, 256, "kernel_mamba3_mimo_phase1_%s", dims); break;
+        case GGML_METAL_MAMBA3_MIMO_PHASE3:     snprintf(base, 256, "kernel_mamba3_mimo_phase3_%s", dims); break;
+        case GGML_METAL_MAMBA3_MIMO_ANGLES:     snprintf(base, 256, "kernel_mamba3_mimo_angles");     main_kernel = false; break;
+        case GGML_METAL_MAMBA3_MIMO_CHUNK_SCAN: snprintf(base, 256, "kernel_mamba3_mimo_chunk_scan"); main_kernel = false; break;
+        default: GGML_ABORT("fatal error");
+    }
+
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    res.nsg = OP_MAMBA3_MIMO_NSG;
+
+    if (main_kernel) {
+        // [ k x2 | q | v x2 | gz | cs | sn | ang | rms | coef ] - keep in sync with kernels/mamba3.metal
+        // (and with the supports_op check)
+        res.smem = GGML_PAD((3*R*D_qk + 3*R*D_v + 3*n_ang + 2*R + 4)*sizeof(float), 16);
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_geodesic(ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_GEODESIC);
+
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_geodesic_%s", ggml_type_name(op->src[0]->type));
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    // per-simdgroup partial sums of the two reductions
+    res.smem = GGML_PAD(2*32*sizeof(float), 16);
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_olala_moe(ggml_metal_library_t lib, const ggml_tensor * op, int which) {
+    GGML_ASSERT(op->op == GGML_OP_OLALA_MOE);
+
+    const ggml_tensor * w = which == 0 ? op->src[1] : which == 1 || which == 4 ? op->src[4] : which == 2 ? op->src[5] : op->src[6];
+    const char * kname   = which == 0 ? "a" : which == 1 ? "b1" : which == 2 ? "b2" : which == 3 ? "c" : which == 4 ? "m" : "f";
+
+    char base[256];
+    char name[256];
+
+    const int32_t nch_e = (int32_t) (op->src[0]->ne[0]/128);
+    const int32_t nch_l = (int32_t) (op->src[1]->ne[1]/128);
+    const int32_t nch_f = (int32_t) (op->src[4]->ne[1]/128);
+    const int32_t nch_s = (int32_t) (op->src[7]->ne[1]/128);
+    const int32_t msplit = ggml_metal_op_olala_moe_msplit(op);
+    const int32_t nf    = msplit > 0 ? (int32_t) (op->src[4]->ne[1]/msplit/4) : 1;
+
+    const int           is = ggml_metal_op_olala_moe_sh_src(which);
+    const ggml_tensor * ws = is >= 0 ? op->src[is] : w;
+    const bool m_mixed = which == 4 && (op->src[5]->type != w->type || op->src[7]->type != w->type || op->src[8]->type != w->type);
+    if (m_mixed) {
+        snprintf(base, 256, "kernel_olala_moe_m_%s_%s_%s_%s", ggml_type_name(w->type), ggml_type_name(op->src[5]->type),
+                 ggml_type_name(op->src[7]->type), ggml_type_name(op->src[8]->type));
+    } else if (ws->type == w->type) {
+        snprintf(base, 256, "kernel_olala_moe_%s_%s", kname, ggml_type_name(w->type));
+    } else {
+        snprintf(base, 256, "kernel_olala_moe_%s_%s_%s", kname, ggml_type_name(w->type), ggml_type_name(ws->type));
+    }
+    snprintf(name, 256, "%s_e%d_l%d_f%d_s%d_m%d", base, nch_e, nch_l, nch_f, nch_s, nf);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+        ggml_metal_cv_set_int32(cv, nch_e, FC_OLALA_MOE + 0);
+        ggml_metal_cv_set_int32(cv, nch_l, FC_OLALA_MOE + 1);
+        ggml_metal_cv_set_int32(cv, nch_f, FC_OLALA_MOE + 2);
+        ggml_metal_cv_set_int32(cv, nch_s, FC_OLALA_MOE + 3);
+        ggml_metal_cv_set_int32(cv, nf,    FC_OLALA_MOE + 4);
+
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+        ggml_metal_cv_free(cv);
+    }
+
+    res.nsg  = 8;
+    res.smem = ggml_metal_op_olala_moe_smem(op, which);
+
+    return res;
+}
+
+static ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_simple(ggml_metal_library_t lib, const char * base) {
+    char name[256];
+    snprintf(name, 256, "%s", base);
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+    res.nsg = 8;
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_olala_mmv(ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_OLALA_MMV);
+    char base[256];
+    const bool staged = ggml_metal_op_olala_mmv_staged(op);
+    snprintf(base, 256, "kernel_olala_mmv%s_%s", staged ? "_st" : "", ggml_type_name(op->src[1]->type));
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline_simple(lib, base);
+    res.smem = staged ? GGML_PAD(std::min<int64_t>(4, op->src[0]->ne[1])*op->src[0]->ne[0]*sizeof(float), 16) : 0;
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_olala_tpa_attn(ggml_metal_library_t lib, const ggml_tensor * op, bool reduce) {
+    GGML_ASSERT(op->op == GGML_OP_OLALA_TPA_ATTN);
+    if (reduce) {
+        return ggml_metal_library_get_pipeline_simple(lib, "kernel_olala_tpa_attn_reduce");
+    }
+    const int32_t hn = ggml_get_op_params_i32(op, 0);
+    const int32_t r  = ggml_get_op_params_i32(op, 1);
+    const int32_t nc = 8; // DTPA_NC
+
+    char base[256];
+    char name[256];
+    snprintf(base, 256, "kernel_olala_tpa_attn_%s_ne%d", ggml_type_name(op->src[1]->type), (int) (op->src[0]->ne[0]/32));
+    snprintf(name, 256, "%s_hn%d_r%d", base, hn, r);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+        ggml_metal_cv_set_int32(cv, hn, FC_OLALA_TPA + 0);
+        ggml_metal_cv_set_int32(cv, r,  FC_OLALA_TPA + 1);
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+        ggml_metal_cv_free(cv);
+    }
+    res.smem = ggml_metal_op_olala_tpa_attn_smem(op, nc);
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_olala_tpa_expand(ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_OLALA_TPA_EXPAND);
+    char base[256];
+    snprintf(base, 256, "kernel_olala_tpa_expand_%s", ggml_type_name(op->src[0]->type));
+    return ggml_metal_library_get_pipeline_simple(lib, base);
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_olala_tpa_prep(ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_OLALA_TPA_PREP);
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline_simple(lib, "kernel_olala_tpa_prep_f32");
+    const int64_t Dh = ggml_get_op_params_i32(op, 3);
+    res.smem = GGML_PAD((2*Dh + 8)*sizeof(float), 16);
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_olala_diff_gate(ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_OLALA_DIFF_GATE);
+    return ggml_metal_library_get_pipeline_simple(lib, "kernel_olala_diff_gate_f32");
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_solve_tri(ggml_metal_library_t lib, const ggml_tensor * op) {
     char base[256];
     char name[256];
