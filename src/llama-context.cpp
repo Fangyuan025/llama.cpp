@@ -393,8 +393,9 @@ llama_context::llama_context(
 
         const char * LLAMA_KV_ROWS_DISABLE = getenv("LLAMA_KV_ROWS_DISABLE");
         if (!LLAMA_KV_ROWS_DISABLE) {
-            // Olala's TPA attention reads each stream's whole cache, not the cell rows of a unified one
-            cparams.auto_fkvr = cparams.kv_unified && model.arch != LLM_ARCH_OLALA;
+            // Olala's TPA attention and Unlimited-OCR-2's routed attention read each stream's whole cache,
+            // not the cell rows of a unified one
+            cparams.auto_fkvr = cparams.kv_unified && model.arch != LLM_ARCH_OLALA && model.arch != LLM_ARCH_UNLIMITEDOCR2;
         } else {
             LLAMA_LOG_INFO("%s: LLAMA_KV_ROWS_DISABLE set, disabling kv_rows\n", __func__);
             cparams.auto_fkvr = false;

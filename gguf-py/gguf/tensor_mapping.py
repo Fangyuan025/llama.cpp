@@ -1791,6 +1791,11 @@ class TensorNameMap:
         MODEL_TENSOR.INDEXER_K_NORM: (
             "model.layers.{bid}.self_attn.indexer.k_norm",  # DSA
             "model.layers.{bid}.self_attn.index_k_norm",    # MSA
+            "model.layers.{bid}.self_attn.dash_router.k_norm", # unlimited-ocr2
+        ),
+
+        MODEL_TENSOR.INDEXER_HEAD_CLS: (
+            "model.layers.{bid}.self_attn.dash_router.head_cls", # unlimited-ocr2
         ),
 
         MODEL_TENSOR.INDEXER_PROJ: (
@@ -1815,14 +1820,17 @@ class TensorNameMap:
 
         MODEL_TENSOR.INDEXER_Q_PROJ: (
             "model.layers.{bid}.self_attn.index_q_proj", # MSA
+            "model.layers.{bid}.self_attn.dash_router.q_proj", # unlimited-ocr2
         ),
 
         MODEL_TENSOR.INDEXER_K_PROJ: (
             "model.layers.{bid}.self_attn.index_k_proj", # MSA
+            "model.layers.{bid}.self_attn.dash_router.k_proj", # unlimited-ocr2
         ),
 
         MODEL_TENSOR.INDEXER_Q_NORM: (
             "model.layers.{bid}.self_attn.index_q_norm", # MSA
+            "model.layers.{bid}.self_attn.dash_router.q_norm", # unlimited-ocr2
         ),
 
         MODEL_TENSOR.HC_ATTN_FN: (
