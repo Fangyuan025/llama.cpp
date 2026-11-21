@@ -5553,6 +5553,447 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     }
 };
 
+// GGML_OP_MAMBA3_MIMO (fused Olala mixer core, raw projections in)
+struct test_mamba3_mimo : public test_case {
+    const int64_t d_qk;
+    const int64_t r; // MIMO rank
+    const int64_t d_v;
+    const int64_t head_count;
+    const int64_t n_seq_tokens;
+    const int64_t n_seqs;
+
+    std::string vars() override {
+        return VARS_TO_STR6(d_qk, r, d_v, head_count, n_seq_tokens, n_seqs);
+    }
+
+    double max_nmse_err() override {
+        return 1e-6; // long recurrences through exp/tanh/sin/cos of different libms
+    }
+
+    test_mamba3_mimo(int64_t d_qk = 128, int64_t r = 4, int64_t d_v = 64, int64_t head_count = 48,
+            int64_t n_seq_tokens = 1, int64_t n_seqs = 1)
+        : d_qk(d_qk), r(r), d_v(d_v), head_count(head_count),
+          n_seq_tokens(n_seq_tokens), n_seqs(n_seqs) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t H = head_count, n_tok = n_seq_tokens * n_seqs, n_ang = d_qk / 4;
+        const int64_t n_embd_s = H*d_v*d_qk + H*r*d_qk + H*r*d_v + H*n_ang;
+        ggml_tensor * pdyn   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*r*d_qk + n_ang, n_tok);
+        ggml_tensor * pstat  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (2*d_v + 3)*H, n_tok);
+        ggml_tensor * bias   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_qk, 2*r, H);
+        ggml_tensor * mxz    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_v, 2*r, H);
+        ggml_tensor * mimo_o = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_v, r, H);
+        ggml_tensor * norms  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_qk, 2);
+        ggml_tensor * misc   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, 2);
+        ggml_tensor * state  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd_s, n_seqs);
+        ggml_set_name(state, "state");
+        return ggml_mamba3_mimo(ctx, pdyn, pstat, bias, mxz, mimo_o, norms, misc, state, 1e-6f, 1e-4f);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "state") == 0) {
+                init_tensor_uniform(t, -0.5f, 0.5f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// GGML_OP_MAMBA3_MIMO + the cpy of the new state into the recurrent cache, as built by the
+// Olala graph (exercises the Metal MAMBA3_MIMO + CPY fusion)
+struct test_mamba3_mimo_cache_fusion : public test_case {
+    const int64_t d_qk;
+    const int64_t r;
+    const int64_t d_v;
+    const int64_t head_count;
+    const int64_t n_seq_tokens;
+    const int64_t n_seqs;
+
+    ggml_tensor * cpy_node = nullptr;
+    ggml_tensor * y_node   = nullptr;
+
+    std::string vars() override {
+        return VARS_TO_STR6(d_qk, r, d_v, head_count, n_seq_tokens, n_seqs);
+    }
+
+    double max_nmse_err() override {
+        return 1e-6;
+    }
+
+    test_mamba3_mimo_cache_fusion(int64_t d_qk = 128, int64_t r = 4, int64_t d_v = 64, int64_t head_count = 48,
+            int64_t n_seq_tokens = 1, int64_t n_seqs = 1)
+        : d_qk(d_qk), r(r), d_v(d_v), head_count(head_count),
+          n_seq_tokens(n_seq_tokens), n_seqs(n_seqs) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t H = head_count, n_tok = n_seq_tokens * n_seqs, n_ang = d_qk / 4;
+        const int64_t n_embd_s = H*d_v*d_qk + H*r*d_qk + H*r*d_v + H*n_ang;
+        ggml_tensor * pdyn   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*r*d_qk + n_ang, n_tok);
+        ggml_tensor * pstat  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (2*d_v + 3)*H, n_tok);
+        ggml_tensor * bias   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_qk, 2*r, H);
+        ggml_tensor * mxz    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_v, 2*r, H);
+        ggml_tensor * mimo_o = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_v, r, H);
+        ggml_tensor * norms  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_qk, 2);
+        ggml_tensor * misc   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, 2);
+        ggml_tensor * state  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd_s, n_seqs);
+        ggml_set_name(state, "state");
+
+        ggml_tensor * res = ggml_mamba3_mimo(ctx, pdyn, pstat, bias, mxz, mimo_o, norms, misc, state, 1e-6f, 1e-4f);
+        ggml_set_name(res, "m3_out");
+
+        // new state (tail of the result) -> rows [1, 1 + n_seqs) of the recurrent cache
+        ggml_tensor * state_new = ggml_view_2d(ctx, res, n_embd_s, n_seqs,
+                ggml_row_size(res->type, n_embd_s), ggml_row_size(res->type, d_v*H*n_tok));
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd_s, n_seqs + 2);
+        ggml_set_name(cache, "cache");
+        ggml_tensor * dst = ggml_view_2d(ctx, cache, n_embd_s, n_seqs, cache->nb[1], cache->nb[1]);
+
+        ggml_tensor * cpy = ggml_cpy(ctx, state_new, dst);
+        ggml_set_name(cpy, "m3_cache_cpy");
+        cpy_node = cpy;
+
+        // y (head of the result)
+        ggml_tensor * y = ggml_cont(ctx, ggml_view_2d(ctx, res, d_v*H, n_tok, ggml_row_size(res->type, d_v*H), 0));
+        ggml_set_name(y, "m3_y");
+        y_node = y;
+
+        // neither the op nor the cpy is the graph output; the cpy must directly follow the op
+        return ggml_add(ctx, ggml_sum(ctx, cpy), ggml_sum(ctx, y));
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MAMBA3_MIMO_CACHE_FUSION";
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { cpy_node, y_node }; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "state") == 0) {
+                init_tensor_uniform(t, -0.5f, 0.5f);
+            } else if (strcmp(t->name, "cache") == 0) {
+                init_tensor_uniform(t, 0.0f, 0.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// GGML_OP_GEODESIC
+struct test_geodesic : public test_case {
+    const int64_t n_embd;
+    const int64_t n_rows;
+    const float   inv_depth;
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, n_rows, inv_depth);
+    }
+
+    test_geodesic(int64_t n_embd = 1536, int64_t n_rows = 7, float inv_depth = 0.25f)
+        : n_embd(n_embd), n_rows(n_rows), inv_depth(inv_depth) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_rows);
+        ggml_tensor * g     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_rows);
+        ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        ggml_tensor * bias  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        return ggml_geodesic(ctx, x, g, scale, bias, inv_depth);
+    }
+};
+
+// GGML_OP_OLALA_MOE (the Olala latent MoE block; CPU reference vs the Metal 3-dispatch implementation)
+struct test_olala_moe : public test_case {
+    const ggml_type type_w;
+    const int64_t n_embd;
+    const int64_t n_tok;
+    const int64_t n_lat;
+    const int64_t n_expert;
+    const int64_t n_ff;
+    const int64_t n_ff_sh;
+    const int     k;
+    const float   w_scale;
+    const int     geo; // bits: 1: followed by GGML_OP_GEODESIC(x2, moe), 2: input = GGML_OP_GEODESIC(x0, g),
+                       // 4: followed by GGML_OP_GEODESIC(input, moe) as in the model (the Metal backend fuses them for small batches)
+    const int     mix; // weight types as in quantized files: 1: q8_0-safe2 (Q6_K W_down, BF16 W_lu / W_ds, type_w for the
+                       // others), 2: q5_k_m with the safe overrides (Q5_K W_ld / W_down / W_us / W_ds, Q8_0 W_up, BF16 W_lu),
+                       // 3: as 2 with Q6_K W_down / W_ds (the q5_k_m layers that keep 6 bits)
+
+    std::string vars() override {
+        return VARS_TO_STR9(type_w, n_embd, n_tok, n_lat, n_expert, n_ff, n_ff_sh, k, w_scale) + (geo ? ",geo=" + std::to_string(geo) : "") +
+               (mix ? ",mix=" + std::to_string(mix) : "");
+    }
+
+    double max_nmse_err() override {
+        return 5e-4; // the CPU reference rounds the activations to the weight type before its dot products
+    }
+
+    test_olala_moe(ggml_type type_w = GGML_TYPE_BF16, int64_t n_embd = 1536, int64_t n_tok = 1, int64_t n_lat = 384,
+            int64_t n_expert = 256, int64_t n_ff = 768, int64_t n_ff_sh = 1536, int k = 6, float w_scale = 2.45f, int geo = 0, int mix = 0)
+        : type_w(type_w), n_embd(n_embd), n_tok(n_tok), n_lat(n_lat), n_expert(n_expert), n_ff(n_ff), n_ff_sh(n_ff_sh), k(k), w_scale(w_scale), geo(geo),
+          mix(mix) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tok);
+        if (geo & 2) {
+            ggml_tensor * g     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tok);
+            ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+            ggml_tensor * gbias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+            x = ggml_geodesic(ctx, x, g, scale, gbias, 0.25f);
+        }
+        const ggml_type type_q5 = mix >= 2 ? GGML_TYPE_Q5_K : type_w;
+        ggml_tensor * w_ld   = ggml_new_tensor_2d(ctx, type_q5,       n_embd, n_lat);
+        ggml_tensor * w_r    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_expert);
+        ggml_tensor * bias   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_expert);
+        const ggml_type type_up = mix >= 2 ? GGML_TYPE_Q8_0 : type_w;
+        const ggml_type type_dn = mix == 1 || mix == 3 ? GGML_TYPE_Q6_K : type_q5;
+        const ggml_type type_lu = mix ? GGML_TYPE_BF16 : type_w;
+        const ggml_type type_ds = mix == 1 ? GGML_TYPE_BF16 : mix == 3 ? GGML_TYPE_Q6_K : type_q5;
+        ggml_tensor * w_up   = ggml_new_tensor_3d(ctx, type_up,       n_lat, n_ff, n_expert);
+        ggml_tensor * w_down = ggml_new_tensor_3d(ctx, type_dn,       n_ff, n_lat, n_expert);
+        ggml_tensor * w_lu   = ggml_new_tensor_2d(ctx, type_lu,       n_lat, n_embd);
+        ggml_tensor * w_us   = ggml_new_tensor_2d(ctx, type_q5,       n_embd, n_ff_sh);
+        ggml_tensor * w_ds   = ggml_new_tensor_2d(ctx, type_ds,       n_ff_sh, n_embd);
+        ggml_tensor * out    = ggml_olala_moe(ctx, x, w_ld, w_r, bias, w_up, w_down, w_lu, w_us, w_ds, k, w_scale, -1);
+        if (geo & 4) {
+            // as in the model: l_out = GEODESIC(moe input, moe output)
+            ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+            ggml_tensor * gbias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+            out = ggml_geodesic(ctx, x, out, scale, gbias, 0.5f);
+        }
+        if (geo & 1) {
+            ggml_tensor * x2    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tok);
+            ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+            ggml_tensor * gbias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+            out = ggml_geodesic(ctx, x2, out, scale, gbias, 0.5f);
+        }
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -0.2f, 0.2f);
+        }
+        // router bias: a permutation of 0, 2, 4, ... The sigmoid of the logits is in (0, 1), so the bias alone picks
+        // the experts with margins >= 1 and the top-k cannot differ between backends (it only selects: the expert
+        // weights use the logits)
+        ggml_tensor * bias = nullptr;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op == GGML_OP_OLALA_MOE) {
+                bias = t->src[3];
+            }
+        }
+        GGML_ASSERT(bias != nullptr && bias->type == GGML_TYPE_F32);
+        std::vector<float> b(n_expert);
+        for (int64_t e = 0; e < n_expert; ++e) {
+            b[e] = 2.0f*(float) e;
+        }
+        std::mt19937 gen(1234);
+        std::shuffle(b.begin(), b.end(), gen);
+        ggml_backend_tensor_set(bias, b.data(), 0, b.size()*sizeof(float));
+    }
+};
+
+// GGML_OP_OLALA_MMV
+struct test_olala_mmv : public test_case {
+    const ggml_type type_w;
+    const int64_t n_embd;
+    const int64_t n_tok;
+    const std::vector<int64_t> rows;
+
+    std::string vars() override {
+        return VARS_TO_STR3(type_w, n_embd, n_tok) + ",n_ws=" + std::to_string(rows.size()) + ",rows0=" + std::to_string(rows[0]);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_olala_mmv(ggml_type type_w = GGML_TYPE_BF16, int64_t n_embd = 1536, int64_t n_tok = 1,
+            std::vector<int64_t> rows = { 6144, 48, 48, 512, 512, 12, 12, 12, 4608 })
+        : type_w(type_w), n_embd(n_embd), n_tok(n_tok), rows(rows) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tok);
+        ggml_tensor * ws[9];
+        GGML_ASSERT(rows.size() <= 9);
+        for (size_t i = 0; i < rows.size(); ++i) {
+            ws[i] = ggml_new_tensor_2d(ctx, type_w, n_embd, rows[i]);
+        }
+        return ggml_olala_mmv(ctx, x, ws, (int) rows.size());
+    }
+};
+
+// GGML_OP_OLALA_TPA_PREP
+struct test_olala_tpa_prep : public test_case {
+    const int H, Hn, R, Dh, n_tok, n_seqs;
+    const bool factored;
+
+    std::string vars() override {
+        return VARS_TO_STR7(H, Hn, R, Dh, n_tok, n_seqs, factored);
+    }
+
+    double max_nmse_err() override {
+        return 1e-6;
+    }
+
+    test_olala_tpa_prep(int H = 48, int Hn = 12, int R = 4, int Dh = 128, int n_tok = 1, int n_seqs = 1, bool factored = false)
+        : H(H), Hn(Hn), R(R), Dh(Dh), n_tok(n_tok), n_seqs(n_seqs), factored(factored) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int Hs = H - Hn;
+        const int64_t ROW = (int64_t) H*Dh + 2*Hn*R + 2*R*Dh + 3*Hn + (int64_t) Hs*Dh;
+        ggml_tensor * pr     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ROW, n_tok);
+        ggml_tensor * prev   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*Hn*Dh, n_seqs);
+        ggml_tensor * pos    = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tok);
+        ggml_set_name(pos, "pos");
+        ggml_tensor * q_norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, Dh);
+        ggml_tensor * k_norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, Dh);
+        ggml_tensor * scaler = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
+        if (factored) {
+            return ggml_olala_tpa_prep_factored(ctx, pr, prev, pos, q_norm, k_norm, scaler, H, Hn, R, Dh, Hs, n_seqs, 1e-6f, 4096.0f, 0.5f);
+        }
+        return ggml_olala_tpa_prep(ctx, pr, prev, pos, q_norm, k_norm, scaler, H, Hn, R, Dh, Hs, n_seqs, 1e-6f, 4096.0f, 0.5f);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "pos") == 0) {
+                // seq-major tokens: the first token of the first sequence is at position 0 (alpha masked), the others not
+                std::vector<int32_t> v(n_tok);
+                const int n_seq_t = n_tok/n_seqs;
+                for (int i = 0; i < n_tok; ++i) {
+                    v[i] = (i/n_seq_t == 0) ? i % n_seq_t : 100 + i % n_seq_t;
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, n_tok*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+            }
+        }
+    }
+};
+
+// GGML_OP_OLALA_TPA_ATTN
+struct test_olala_tpa_attn : public test_case {
+    const int H, Hn, R, Dh, n_kv, T, ns;
+    const ggml_type type_kv;
+    const bool contig; // previous cell c - 1 everywhere (one sequence per stream, as in decode)
+
+    std::string vars() override {
+        return VARS_TO_STR9(H, Hn, R, Dh, n_kv, T, ns, type_kv, contig);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_olala_tpa_attn(int H = 48, int Hn = 12, int R = 4, int Dh = 128, int n_kv = 256, int T = 1, int ns = 1, ggml_type type_kv = GGML_TYPE_F16,
+            bool contig = false)
+        : H(H), Hn(Hn), R(R), Dh(Dh), n_kv(n_kv), T(T), ns(ns), type_kv(type_kv), contig(contig) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, Dh, H, T, ns);
+        ggml_tensor * k    = ggml_new_tensor_3d(ctx, type_kv, ggml_olala_tpa_row_k(Hn, R, Dh), n_kv, ns);
+        ggml_tensor * v    = ggml_new_tensor_3d(ctx, type_kv, ggml_olala_tpa_row_v(Hn, R, Dh), n_kv, ns);
+        ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, GGML_PAD(T, 8), 1, ns);
+        ggml_tensor * prev = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, ns);
+        ggml_set_name(mask, "mask");
+        ggml_set_name(prev, "prev");
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+        return ggml_olala_tpa_attn(ctx, q, k, v, mask, prev, Hn, R, 1.0f/Dh, 150.0f);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(7);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "prev") == 0) {
+                // mostly the cell before, some cells elsewhere, some without a previous token
+                std::vector<int32_t> p(n_kv*ns);
+                for (int i = 0; i < n_kv*ns; ++i) {
+                    const int c = i % n_kv;
+                    const int r = rng() % 16;
+                    p[i] = contig ? c - 1 : (c == 0 || r == 0 ? -1 : (r == 1 ? (int) (rng() % n_kv) : c - 1));
+                }
+                ggml_backend_tensor_set(t, p.data(), 0, p.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "mask") == 0) {
+                // a few masked cells per row, the rest causal-like
+                std::vector<ggml_fp16_t> m(ggml_nelements(t));
+                for (size_t i = 0; i < m.size(); ++i) {
+                    m[i] = ggml_fp32_to_fp16(rng() % 7 == 0 ? -INFINITY : 0.0f);
+                }
+                ggml_backend_tensor_set(t, m.data(), 0, m.size()*sizeof(ggml_fp16_t));
+            } else if (strcmp(t->name, "k") == 0 || strcmp(t->name, "v") == 0) {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+            } else {
+                init_tensor_uniform(t, -2.0f, 2.0f);
+            }
+        }
+    }
+};
+
+// GGML_OP_OLALA_TPA_EXPAND
+struct test_olala_tpa_expand : public test_case {
+    const int Hn, R, Dh, n_kv, ns;
+    const bool is_v;
+    const ggml_type type_kv;
+
+    std::string vars() override {
+        return VARS_TO_STR7(Hn, R, Dh, n_kv, ns, is_v, type_kv);
+    }
+
+    test_olala_tpa_expand(int Hn = 12, int R = 4, int Dh = 128, int n_kv = 64, int ns = 1, bool is_v = false, ggml_type type_kv = GGML_TYPE_F16)
+        : Hn(Hn), R(R), Dh(Dh), n_kv(n_kv), ns(ns), is_v(is_v), type_kv(type_kv) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n = is_v ? ggml_olala_tpa_row_v(Hn, R, Dh) : ggml_olala_tpa_row_k(Hn, R, Dh);
+        ggml_tensor * rows = ggml_new_tensor_3d(ctx, type_kv, n, n_kv, ns);
+        ggml_tensor * prev = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, ns);
+        ggml_set_name(prev, "prev");
+        return ggml_olala_tpa_expand(ctx, rows, prev, Hn, R, Dh, is_v);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(11);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "prev") == 0) {
+                std::vector<int32_t> p(n_kv*ns);
+                for (int i = 0; i < n_kv*ns; ++i) {
+                    const int c = i % n_kv;
+                    p[i] = c == 0 || rng() % 8 == 0 ? -1 : (int) (rng() % n_kv);
+                }
+                ggml_backend_tensor_set(t, p.data(), 0, p.size()*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+            }
+        }
+    }
+};
+
+// GGML_OP_OLALA_DIFF_GATE
+struct test_olala_diff_gate : public test_case {
+    const int64_t Dh, H, Hn, n_tok;
+
+    std::string vars() override {
+        return VARS_TO_STR4(Dh, H, Hn, n_tok);
+    }
+
+    test_olala_diff_gate(int64_t Dh = 128, int64_t H = 48, int64_t Hn = 12, int64_t n_tok = 3)
+        : Dh(Dh), H(H), Hn(Hn), n_tok(n_tok) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * attn = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, Dh, H, n_tok);
+        ggml_tensor * lam  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, Hn, n_tok);
+        ggml_tensor * gs   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (H - Hn)*Dh, n_tok);
+        return ggml_olala_diff_gate(ctx, attn, lam, gs);
+    }
+};
+
 // GGML_OP_GATED_LINEAR_ATTN
 struct test_gla : public test_case {
     const ggml_type type;
@@ -13831,6 +14272,89 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32,   4, 2, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));
 
+    // (type, d_qk, r, d_v, head_count, n_seq_tokens, n_seqs); Olala 7A1B dims: D_qk=64, R=4, D_v=64, H=48
+    // (d_qk, r, d_v, head_count, n_seq_tokens, n_seqs); Olala 7A1B: 128, 4, 64, 48
+    test_cases.emplace_back(new test_mamba3_mimo(128, 4, 64, 48,   1, 1)); // decode
+    test_cases.emplace_back(new test_mamba3_mimo(128, 4, 64, 48,   1, 4)); // batched decode
+    test_cases.emplace_back(new test_mamba3_mimo(128, 4, 64, 48,   7, 1)); // short prefill / spec-decode verify
+    test_cases.emplace_back(new test_mamba3_mimo(128, 4, 64, 48,  64, 1)); // prefill
+    test_cases.emplace_back(new test_mamba3_mimo(128, 4, 64, 48,  17, 3)); // odd sizes
+    test_cases.emplace_back(new test_mamba3_mimo(128, 4, 64, 48, 256, 1)); // chunked prefill
+    test_cases.emplace_back(new test_mamba3_mimo(128, 4, 64, 48, 192, 2)); // chunked, multi-seq
+    test_cases.emplace_back(new test_mamba3_mimo(128, 4, 64, 48, 150, 1)); // chunked, partial tail chunk
+    test_cases.emplace_back(new test_mamba3_mimo( 16, 2,  8,  3,  33, 2)); // small dims
+    test_cases.emplace_back(new test_mamba3_mimo( 64, 4, 64,  4, 100, 1));
+    test_cases.emplace_back(new test_mamba3_mimo_cache_fusion(128, 4, 64, 48,  1, 1)); // decode
+    test_cases.emplace_back(new test_mamba3_mimo_cache_fusion(128, 4, 64, 48,  1, 4)); // batched decode
+    test_cases.emplace_back(new test_mamba3_mimo_cache_fusion(128, 4, 64, 48, 96, 2)); // chunked prefill
+    test_cases.emplace_back(new test_mamba3_mimo_cache_fusion( 16, 2,  8,  3, 33, 2)); // generic dims
+    test_cases.emplace_back(new test_geodesic(1536, 1, 1.0f));
+    test_cases.emplace_back(new test_geodesic(1536, 7, 0.25f));
+    test_cases.emplace_back(new test_geodesic(1536, 512, 1.0f/36));
+    test_cases.emplace_back(new test_geodesic(100, 3, 0.5f));
+    // (type_w, n_embd, n_tok, n_lat, n_expert, n_ff, n_ff_sh, k, w_scale); Olala 7A1B: bf16, 1536, 384, 256, 768, 1536, 6, 2.45
+    test_cases.emplace_back(new test_olala_mmv(GGML_TYPE_BF16, 1536, 1));
+    test_cases.emplace_back(new test_olala_mmv(GGML_TYPE_BF16, 1536, 5));
+    test_cases.emplace_back(new test_olala_mmv(GGML_TYPE_F32,   256, 3, { 64, 8, 200 }));
+    test_cases.emplace_back(new test_olala_mmv(GGML_TYPE_Q8_0, 1536, 1));
+    test_cases.emplace_back(new test_olala_mmv(GGML_TYPE_Q8_0, 1536, 5));
+    for (ggml_type t : { GGML_TYPE_Q5_K, GGML_TYPE_Q6_K }) { // q5_k_m files
+        test_cases.emplace_back(new test_olala_mmv(t, 1536, 1));
+        test_cases.emplace_back(new test_olala_mmv(t, 1536, 5));
+    }
+    test_cases.emplace_back(new test_olala_tpa_prep(48, 12, 4, 128, 1, 1));   // decode
+    test_cases.emplace_back(new test_olala_tpa_prep(48, 12, 4, 128, 4, 4));   // batched decode
+    test_cases.emplace_back(new test_olala_tpa_prep(48, 12, 4, 128, 6, 2));   // 3 tokens per sequence (in-batch shift)
+    test_cases.emplace_back(new test_olala_tpa_prep(8, 2, 3, 64, 5, 1));      // small dims, gate not divisible by H
+    test_cases.emplace_back(new test_olala_tpa_prep(48, 12, 4, 128, 1, 1, true)); // factored
+    test_cases.emplace_back(new test_olala_tpa_prep(48, 12, 4, 128, 6, 2, true));
+    test_cases.emplace_back(new test_olala_tpa_prep(8, 2, 3, 64, 5, 1, true));
+    for (ggml_type type_kv : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
+        for (bool is_v : { false, true }) {
+            test_cases.emplace_back(new test_olala_tpa_expand(12, 4, 128, 100, 2, is_v, type_kv));
+            test_cases.emplace_back(new test_olala_tpa_expand(4,  3, 64,  37,  1, is_v, type_kv));
+        }
+    }
+    for (ggml_type type_kv : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
+        test_cases.emplace_back(new test_olala_tpa_attn(48, 12, 4, 128, 256,  1, 1, type_kv));  // decode
+        test_cases.emplace_back(new test_olala_tpa_attn(48, 12, 4, 128, 1000, 1, 2, type_kv));  // 2 streams, partial chunk
+        test_cases.emplace_back(new test_olala_tpa_attn(48, 12, 4, 128, 4100, 1, 1, type_kv, true)); // one sequence
+        test_cases.emplace_back(new test_olala_tpa_attn(48, 12, 4, 128, 96,   7, 1, type_kv));  // several tokens
+        test_cases.emplace_back(new test_olala_tpa_attn(16, 4,  3, 64,  37,   3, 1, type_kv));  // small dims
+    }
+    test_cases.emplace_back(new test_olala_diff_gate(128, 48, 12, 3));
+    test_cases.emplace_back(new test_olala_diff_gate(64, 8, 2, 1));
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_BF16, 1536,  1, 384,  32, 768, 1536, 6, 2.45f)); // decode (the model has 256 experts: perf mode)
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_BF16, 1536,  1, 384,  32, 768, 1536, 6, 2.45f, 1)); // decode + fused geodesic
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_BF16, 1536,  4, 384,  32, 768, 1536, 6, 2.45f, 1)); // batched + geodesic
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_BF16, 1536,  1, 384,  32, 768, 1536, 6, 2.45f, 3)); // decode, geodesic in and out
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_BF16, 1536,  2, 384,  32, 768, 1536, 6, 2.45f, 2)); // 2 tokens, input geodesic
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_F32,   128,  2, 128,  16, 128,  128, 2, 1.5f, 3)); // small dims, both geodesics
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_BF16, 1536,  4, 384,  32, 768, 1536, 6, 2.45f)); // batched decode
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_BF16, 1536, 19, 384,  32, 768, 1536, 6, 2.45f)); // odd batch (> 8 tokens per pass)
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_F16,   256,  3, 128,  32, 128,  256, 4, 1.0f));  // small dims, f16
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_F32,   128,  2, 128,  16, 128,  128, 2, 1.5f));  // f32, n_ff_sh < n_embd (CPU reference dsh fix)
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_F32,   256,  5, 128,  16, 256,  128, 3, 1.5f));  // f32, 5 tokens (2 passes of kernel a)
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_Q8_0, 1536,  1, 384,  32, 768, 1536, 6, 2.45f, 3)); // Q8_0 decode, geodesic in and out
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_BF16, 1536,  1, 384,  32, 768, 1536, 6, 2.45f, 4)); // decode, output geodesic on the input (model)
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_BF16, 1536,  1, 384,  32, 768, 1536, 6, 2.45f, 6)); // decode, both geodesics as in the model
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_Q8_0, 1536,  1, 384,  32, 768, 1536, 6, 2.45f, 6)); // Q8_0, both geodesics as in the model
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_Q8_0, 1536,  2, 384,  32, 768, 1536, 6, 2.45f, 2)); // Q8_0, 2 tokens
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_Q8_0, 1536,  4, 384,  32, 768, 1536, 6, 2.45f));    // Q8_0, b1/b2 path
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_Q8_0, 1536, 19, 384,  32, 768, 1536, 6, 2.45f));    // Q8_0, odd batch
+    // q8_0-safe2 files (Q6_K W_down, BF16 W_lu / W_ds): mixed-type kernels
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_Q8_0, 1536,  1, 384,  32, 768, 1536, 6, 2.45f, 6, 1)); // decode as in the model
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_Q8_0, 1536,  2, 384,  32, 768, 1536, 6, 2.45f, 2, 1)); // 2 tokens (sh_split)
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_Q8_0, 1536,  4, 384,  32, 768, 1536, 6, 2.45f, 0, 1)); // b1/b2 path
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_Q8_0, 1536,  8, 384,  32, 768, 1536, 6, 2.45f, 4, 1)); // 8 tokens (-ub 8)
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_BF16, 1536,  1, 384,  32, 768, 1536, 6, 2.45f, 0, 1)); // Q6_K W_down with BF16 W_ds
+    // q5_k_m files with the safe overrides (Q5_K or Q6_K W_down / W_ds depending on the layer)
+    for (int mix : { 2, 3 }) {
+        test_cases.emplace_back(new test_olala_moe(GGML_TYPE_Q8_0, 1536, 1, 384, 32, 768, 1536, 6, 2.45f, 6, mix)); // decode as in the model
+        test_cases.emplace_back(new test_olala_moe(GGML_TYPE_Q8_0, 1536, 2, 384, 32, 768, 1536, 6, 2.45f, 2, mix)); // 2 tokens
+        test_cases.emplace_back(new test_olala_moe(GGML_TYPE_Q8_0, 1536, 8, 384, 32, 768, 1536, 6, 2.45f, 4, mix)); // 8 tokens
+    }
+
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
     test_cases.emplace_back(new test_llama(2, true));
@@ -13910,6 +14434,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // Qwen3.8-Flash-Next pooled indexer prefill.
     test_cases.emplace_back(new test_lightning_indexer(128, 4, 1088, 1024, 1, 1, GGML_TYPE_F32));
     test_cases.emplace_back(new test_lightning_indexer(128, 4, 1088, 1024, 1, 1, GGML_TYPE_Q4_0));
+    // Olala factored TPA attention, decode of one sequence (contiguous cells), and the full-cache equivalent
+    // (flash_attn_ext, 12 kv heads x GQA 4, softcap 150)
+    for (int n_kv : { 256, 1024, 4096, 8192, 32768, 131072 }) {
+        test_cases.emplace_back(new test_olala_tpa_attn(48, 12, 4, 128, n_kv, 1, 1, GGML_TYPE_F16, true));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 12, {4, 1}, n_kv, 1, true, false, 0.0f, 150.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
+
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
@@ -14511,6 +15042,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (int64_t nb : { 1, 2048 }) {
             test_cases.emplace_back(new test_top_k_mask(GGML_TYPE_F16, n_kv, 4, n_kv/4, 512, 3, true, nb, 1, 1, true));
             test_cases.emplace_back(new test_top_k_mask(GGML_TYPE_F16, n_kv, 0, 0, 2048, 0, false, nb, 1, 1, true));
+        }
+    }
+
+    // Olala 7A1B MoE block at full size (256 experts)
+    for (ggml_type type_w : { GGML_TYPE_BF16, GGML_TYPE_Q8_0 }) {
+        for (int n_tok : { 1, 4 }) {
+            test_cases.emplace_back(new test_olala_moe(type_w, 1536, n_tok, 384, 256, 768, 1536, 6, 2.45f, 6));
         }
     }
 

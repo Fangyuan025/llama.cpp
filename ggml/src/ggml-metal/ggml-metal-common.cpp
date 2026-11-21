@@ -1,10 +1,13 @@
 #include "ggml-metal-common.h"
 #include "ggml-metal-fusion.h"
+#include "ggml-metal-impl.h"
 
 #include "ggml.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
+#include <algorithm>
+#include <cstdlib>
 #include <vector>
 
 // must stay in sync with the kernel_fwht_<type>_<N> templates in misc.metal. Widths up to
@@ -30,6 +33,241 @@ bool ggml_metal_op_mul_mat_use_fwht(const struct ggml_tensor * op, size_t max_tg
            (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16) && ggml_is_contiguous(op->src[1]) &&
            ggml_is_contiguous(op) && ggml_are_same_shape(op->src[1], op) &&
            ggml_metal_fwht_supported_size(op->src[1]->ne[0], max_tg_mem);
+}
+
+// OLALA_MMV: x staged in threadgroup memory (8 simdgroups, one row each) above 4 tokens, otherwise read from device
+// memory by 4 simdgroups, one row each
+bool ggml_metal_op_olala_mmv_staged(const struct ggml_tensor * op) {
+    return op->src[0]->ne[1] > 4;
+}
+
+int ggml_metal_op_olala_moe_nsplit(const struct ggml_tensor * op) {
+    const int64_t n_ff  = op->src[4]->ne[1];
+    const int64_t n_lat = op->src[1]->ne[1];
+    const int want = 32;
+    for (int ns = (int) std::min<int64_t>(want, n_ff/8); ns >= 1; --ns) {
+        if (n_ff % ns == 0 && (n_ff/ns) % 8 == 0 && n_lat % ns == 0) {
+            return ns;
+        }
+    }
+    return 1;
+}
+
+// n_lat row slices of kernel b2: rows per threadgroup RS = n_lat/nsplit2 with k*RS <= 8*DMOE_B2_MAXI (= 32) items
+int ggml_metal_op_olala_moe_nsplit2(const struct ggml_tensor * op) {
+    const int64_t n_lat = op->src[1]->ne[1];
+    const int64_t k     = ggml_get_op_params_i32(op, 0);
+    const int want_rs = 4;
+    for (int64_t rs = std::min<int64_t>(want_rs, 32/std::max<int64_t>(k, 1)); rs >= 1; --rs) {
+        if (n_lat % rs == 0) {
+            return (int) (n_lat/rs);
+        }
+    }
+    return (int) n_lat;
+}
+
+size_t ggml_metal_op_olala_moe_smem(const struct ggml_tensor * op, int which) {
+    const int64_t n_embd  = op->src[0]->ne[0];
+    const int64_t n_tok   = op->src[0]->ne[1];
+    const int64_t n_lat   = op->src[1]->ne[1];
+    const int64_t n_ff    = op->src[4]->ne[1];
+    const int64_t n_ff_sh = op->src[7]->ne[1];
+    const int64_t k       = ggml_get_op_params_i32(op, 0);
+    const int64_t tb      = std::min<int64_t>(4, n_tok); // DMOE_TB
+    size_t n = 0;
+    switch (which) {
+        case 0: n = tb*n_embd + 16 + 4*8;   break; // a : x of the pass | red (fused input geodesic) | K-split partial sums
+        case 1: n = n_lat + 16 + 2*k;       break; // b1: lat | red | redi | selv | sele
+        case 2: n = n_ff;                   break; // b2: h
+        default: n = std::min<int64_t>(2, n_tok)*(n_lat + n_ff_sh); break; // c : routed | ush of the pass
+    }
+    if (which == 5) {
+        // fused kernel: [ y (n_embd) | red (16) | part (32) | phase scratch: routed (lat | h slice), shared us, acc ]
+        const int64_t ffs = n_ff/ggml_metal_op_olala_moe_msplit(op);
+        n = n_embd + 48 + std::max<int64_t>(((n_lat + 3) & ~3) + ffs, ggml_metal_op_olala_moe_sh_rows(op));
+        return GGML_PAD(n*sizeof(float), 16);
+    }
+    if (which == 4) {
+        // kernel m: routed [ lat | red | redi | selv | sele | h slice ], shared [ x (T x n_embd) | us (T x sh_rows) ]
+        const int64_t ffs = n_ff/ggml_metal_op_olala_moe_msplit(op);
+        n = std::max<int64_t>(((n_lat + 3) & ~3) + ffs, n_tok*(n_embd + ggml_metal_op_olala_moe_sh_rows(op)));
+        return GGML_PAD(n*sizeof(float), 16);
+    }
+    if (ggml_metal_op_olala_moe_sh_split(op)) {
+        // the shared expert runs in extra threadgroups of b1 (up, as kernel a) and b2 (down, as kernel c)
+        switch (which) {
+            case 1: n = std::max<int64_t>(n, tb*n_embd); break;
+            case 2: n = std::max<int64_t>(n, std::min<int64_t>(2, n_tok)*n_ff_sh); break;
+            case 3: n = std::min<int64_t>(2, n_tok)*n_lat; break;
+            default: break;
+        }
+    }
+    return GGML_PAD(n*sizeof(float), 16);
+}
+
+// kernel m (merged up + down) FF slices of an expert and shared-expert rows per threadgroup; 0: not usable
+int ggml_metal_op_olala_moe_msplit(const struct ggml_tensor * op) {
+    const int64_t n_ff = op->src[4]->ne[1];
+    const int want = 24;
+    const int64_t n_lat = op->src[1]->ne[1];
+    if (n_lat > 2*256) {
+        return 0; // DMOE_MD*DMOE_NTH
+    }
+    for (int ns = (int) std::min<int64_t>(want, n_ff/4); ns >= 1; --ns) {
+        if (n_ff % ns == 0 && (n_ff/ns) % 4 == 0 && n_ff/ns <= 64) {
+            return ns;
+        }
+    }
+    return 0;
+}
+
+int ggml_metal_op_olala_moe_sh_rows(const struct ggml_tensor * op) {
+    const int64_t n_ff_sh = op->src[7]->ne[1];
+    const int want = 16;
+    const int step = 4;
+    for (int r = (std::max(step, want)/step)*step; r >= step; r -= step) {
+        if (n_ff_sh % r == 0) {
+            return r;
+        }
+    }
+    return 0;
+}
+
+// kernel m replaces b1 and b2 for up to 2 tokens
+bool ggml_metal_op_olala_moe_merged(const struct ggml_tensor * op) {
+    // kernel m reads W_up, W_down, W_us and W_ds with one weight type or one of the combinations instantiated in
+    // mamba3.metal (kernel_olala_moe_m_<W_up>_<W_down>_<W_us>_<W_ds>)
+    static const ggml_type mixed[][4] = {
+        { GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_BF16 },
+        { GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, GGML_TYPE_BF16 },
+        { GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0 },
+        { GGML_TYPE_Q8_0, GGML_TYPE_Q5_K, GGML_TYPE_Q5_K, GGML_TYPE_Q5_K },
+        { GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K },
+    };
+    const ggml_type t[4] = { op->src[4]->type, op->src[5]->type, op->src[7]->type, op->src[8]->type };
+    bool same_type = t[1] == t[0] && t[2] == t[0] && t[3] == t[0];
+    for (const auto & m : mixed) {
+        same_type = same_type || (t[0] == m[0] && t[1] == m[1] && t[2] == m[2] && t[3] == m[3]);
+    }
+    return same_type && op->src[0]->ne[1] <= 2 && ggml_metal_op_olala_moe_msplit(op) > 0 && ggml_metal_op_olala_moe_sh_rows(op) > 0;
+}
+
+// fused single-dispatch kernel (decode): number of persistent threadgroups, 0 when not usable. All the threadgroups
+// must be resident at once (they wait for each other): at most 3 per GPU core (measured on M3 Ultra: 240 of 80 cores
+// run, 288 do not), so the kernel is not used when the core count is unknown or too small.
+// Opt-in (GGML_METAL_OLALA_MOE_FUSED=1): Metal does not guarantee that the threadgroups of a dispatch are co-resident,
+// and on M3 Ultra it is on par with the 3-dispatch path for Q8_0 (+3% for BF16).
+int ggml_metal_op_olala_moe_fused_ntg(const struct ggml_tensor * op, int gpu_cores) {
+    static const bool enabled = [] { const char * e = getenv("GGML_METAL_OLALA_MOE_FUSED"); return e && atoi(e) != 0; }();
+    if (!enabled || gpu_cores <= 0 || op->src[0]->ne[1] != 1 || !ggml_metal_op_olala_moe_merged(op)) {
+        return 0;
+    }
+    const ggml_type t = op->src[1]->type;
+    for (int i : { 4, 5, 6, 7, 8 }) {
+        if (op->src[i]->type != t) {
+            return 0;
+        }
+    }
+    const int64_t n_embd   = op->src[0]->ne[0];
+    const int64_t n_lat    = op->src[1]->ne[1];
+    const int64_t n_expert = op->src[2]->ne[1];
+    const int64_t n_ff_sh  = op->src[7]->ne[1];
+    const int64_t k        = ggml_get_op_params_i32(op, 0);
+    const int64_t R        = k*ggml_metal_op_olala_moe_msplit(op);
+    if (n_lat > GGML_METAL_DMOE_F_MAX_LAT || n_embd > GGML_METAL_DMOE_F_MAX_EMBD || (n_embd/128) % 2 != 0 || (n_lat + n_expert) % 4 != 0) {
+        return 0;
+    }
+    // needed: rows of [W_ld | W_r] 4 per threadgroup, W_lu rows 16 per threadgroup, one shared-expert threadgroup
+    // after the routed ones; wanted: every shared-expert slice on its own threadgroup
+    const int64_t need = std::max<int64_t>({ (n_lat + n_expert)/4, (n_embd + 15)/16, R + 1 });
+    const int64_t want = R + n_ff_sh/ggml_metal_op_olala_moe_sh_rows(op);
+    const int64_t cap  = 3*(int64_t) gpu_cores;
+    const int64_t P    = std::min(want, cap);
+    if (P < need) {
+        return 0;
+    }
+    return (int) P;
+}
+
+int ggml_metal_op_olala_moe_sh_src(int which) {
+    switch (which) {
+        case 0: return 7; // a : W_ld | W_us
+        case 1: return 7; // b1: W_up | W_us (sh_split)
+        case 2: return 8; // b2: W_down | W_ds (sh_split)
+        case 3: return 8; // c : W_lu | W_ds
+        default: return -1;
+    }
+}
+
+// weight types of kernels a, b1, b2 and c (routed-path weight, shared-expert weight) and of kernel m (W_up, W_down, W_us,
+// W_ds), as instantiated in mamba3.metal: one type among F32 / F16 / BF16 / Q8_0 for all, or the combinations of the
+// q8_0-safe2 and q5_k_m (safe overrides) files below
+static bool dmoe_uniform_type(ggml_type t) {
+    return t == GGML_TYPE_F32 || t == GGML_TYPE_F16 || t == GGML_TYPE_BF16 || t == GGML_TYPE_Q8_0;
+}
+
+bool ggml_metal_op_olala_moe_types_ok(const struct ggml_tensor * op, bool has_bfloat) {
+    struct pair { int which; ggml_type w, s; };
+    static const pair mixed[] = {
+        { 0, GGML_TYPE_Q8_0, GGML_TYPE_BF16 }, { 0, GGML_TYPE_BF16, GGML_TYPE_Q8_0 }, { 0, GGML_TYPE_Q5_K, GGML_TYPE_Q5_K },
+        { 1, GGML_TYPE_Q8_0, GGML_TYPE_BF16 }, { 1, GGML_TYPE_BF16, GGML_TYPE_Q8_0 }, { 1, GGML_TYPE_Q8_0, GGML_TYPE_Q5_K },
+        { 2, GGML_TYPE_Q8_0, GGML_TYPE_BF16 }, { 2, GGML_TYPE_BF16, GGML_TYPE_Q8_0 },
+        { 2, GGML_TYPE_Q6_K, GGML_TYPE_BF16 }, { 2, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0 },
+        { 2, GGML_TYPE_Q5_K, GGML_TYPE_Q5_K }, { 2, GGML_TYPE_Q6_K, GGML_TYPE_Q6_K },
+        { 3, GGML_TYPE_Q8_0, GGML_TYPE_BF16 }, { 3, GGML_TYPE_BF16, GGML_TYPE_Q8_0 },
+        { 3, GGML_TYPE_BF16, GGML_TYPE_Q5_K }, { 3, GGML_TYPE_BF16, GGML_TYPE_Q6_K },
+    };
+    static const int routed[4] = { 1, 4, 5, 6 };
+    for (int which = 0; which < 4; ++which) {
+        const ggml_type tw = op->src[routed[which]]->type;
+        const ggml_type ts = op->src[ggml_metal_op_olala_moe_sh_src(which)]->type;
+        if ((tw == GGML_TYPE_BF16 || ts == GGML_TYPE_BF16) && !has_bfloat) {
+            return false;
+        }
+        bool ok = tw == ts && dmoe_uniform_type(tw);
+        for (const pair & p : mixed) {
+            ok = ok || (p.which == which && p.w == tw && p.s == ts);
+        }
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ggml_metal_op_olala_moe_sh_split(const struct ggml_tensor * op) {
+    return op->src[0]->ne[1] <= 2;
+}
+
+size_t ggml_metal_op_olala_tpa_attn_smem(const struct ggml_tensor * op, int nc) {
+    const int64_t Dh = op->src[0]->ne[0];
+    const int64_t Hn = ggml_get_op_params_i32(op, 0);
+    const int64_t R  = ggml_get_op_params_i32(op, 1);
+    // [ kv (Hn*nc*Dh half) | per simdgroup: 64 float + 64 half | coefficients (nc*(2*Hn*R + 2*Hn) half) | mask, prev (nc) ]
+    return Hn*nc*Dh*2 + Hn*(64*4 + 64*2) + (nc*(2*Hn*R + 2*Hn) + 1)/2*2*2 + 2*nc*4;
+}
+
+bool ggml_metal_op_olala_tpa_attn_use_tensor(const struct ggml_tensor * op, bool has_tensor) {
+    const ggml_tensor * q = op->src[0];
+    const ggml_tensor * k = op->src[1];
+    return has_tensor && k->type == GGML_TYPE_F16 && q->ne[0] == 128 && q->ne[1] == 48 &&
+        ggml_get_op_params_i32(op, 0) == 12 && ggml_get_op_params_i32(op, 1) == 4 && k->ne[1] >= 64;
+}
+
+struct ggml_metal_olala_tpa_attn_split ggml_metal_op_olala_tpa_attn_split(const struct ggml_tensor * op, int gpu_cores, bool has_tensor) {
+    const int64_t n_kv = op->src[1]->ne[1];
+    const int64_t T    = op->src[0]->ne[2]*op->src[0]->ne[3];
+
+    ggml_metal_olala_tpa_attn_split res;
+    res.nc = 8; // DTPA_NC
+    // decode: one threadgroup per GPU core (a single wave: one threadgroup fits per core), two with the tensor kernel
+    // (two fit; measured best on M5 Max), fewer chunks per token for batches; unknown core count: 64
+    const int64_t ntg  = (gpu_cores > 0 ? gpu_cores : 64)*(ggml_metal_op_olala_tpa_attn_use_tensor(op, has_tensor) ? 2 : 1);
+    const int64_t want = std::max<int64_t>(1, std::min<int64_t>((ntg + T - 1)/T, (n_kv + 4*res.nc - 1)/(4*res.nc)));
+    const int64_t chunk = ((n_kv + want - 1)/want + res.nc - 1)/res.nc*res.nc;
+    res.chunk   = (int) std::max<int64_t>(chunk, res.nc);
+    res.n_chunk = (int) ((n_kv + res.chunk - 1)/res.chunk);
+    return res;
 }
 
 bool ggml_metal_op_mul_mat_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm) {
@@ -477,6 +715,7 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
             case GGML_OP_CPY:
             case GGML_OP_CONT:
             case GGML_OP_REPEAT:
+            case GGML_OP_GEODESIC:
                 return true;
             default:
                 return ggml_op_is_empty(op);

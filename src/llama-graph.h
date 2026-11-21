@@ -328,6 +328,10 @@ public:
     // used in view offsets, need to match for valid graph reuse
     uint32_t head;
     int32_t rs_z;
+
+    // the ubatch sequences read their own state rows (see llama_memory_recurrent_context::s_copy_is_identity);
+    // graphs may then update the states in place, so it must match for graph reuse too
+    bool s_copy_ident = false;
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {
@@ -397,6 +401,10 @@ public:
     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
 
     llm_attn_mask self_attn_mask;
+
+    // optional, created by the models that need it: I32 [n_kv, n_stream], cell of the previous position of the same
+    // sequence (llama_kv_cache::set_input_prev_cell)
+    ggml_tensor * self_prev_cell = nullptr;
 
     // note: assumes v_rot^2 == I
     std::vector<ggml_tensor *> self_k_rot;

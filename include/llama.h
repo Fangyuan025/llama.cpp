@@ -198,6 +198,17 @@ extern "C" {
 
     LLAMA_API const char * llama_flash_attn_type_name(enum llama_flash_attn_type flash_attn_type);
 
+    // KV cache layout of the TPA attention layers (Olala): the expanded K/V (full) or the TPA factors (factored: ~2.6x
+    // less memory per token, more compute in the attention). auto: factored on devices with matrix units (Metal: M5 / A19),
+    // full otherwise
+    enum llama_tpa_cache_type {
+        LLAMA_TPA_CACHE_TYPE_AUTO     = -1,
+        LLAMA_TPA_CACHE_TYPE_FULL     = 0,
+        LLAMA_TPA_CACHE_TYPE_FACTORED = 1,
+    };
+
+    LLAMA_API const char * llama_tpa_cache_type_name(enum llama_tpa_cache_type tpa_cache_type);
+
     enum llama_split_mode {
         LLAMA_SPLIT_MODE_NONE   = 0, // single GPU
         LLAMA_SPLIT_MODE_LAYER  = 1, // split layers and KV across GPUs
@@ -340,6 +351,7 @@ extern "C" {
         enum llama_load_mode  load_mode;  // how to load the model
 
         enum llama_lazy_mode lazy_mode; // on-demand reading of tensors marked by the arch
+        int32_t lazy_cache_mib;         // lazy mode: RAM budget (MiB) for the tensor data read on demand (e.g. MoE experts), -1 = default
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;
@@ -390,6 +402,7 @@ extern "C" {
         enum llama_pooling_type      pooling_type;      // whether to pool (sum) embedding results by sequence id
         enum llama_attention_type    attention_type;    // attention type to use for embeddings
         enum llama_flash_attn_type   flash_attn_type;   // when to enable Flash Attention
+        enum llama_tpa_cache_type    tpa_cache_type;    // KV cache layout of TPA attention layers (Olala)
 
         // ref: https://github.com/ggml-org/llama.cpp/pull/2054
         float    rope_freq_base;   // RoPE base frequency, 0 = from model

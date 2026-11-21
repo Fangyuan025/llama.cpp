@@ -108,6 +108,16 @@ void ggml_compute_forward_dsv4_hc_comb(const struct ggml_compute_params * params
 void ggml_compute_forward_dsv4_hc_pre(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_dsv4_hc_post(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_top_k_mask(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_mamba3_mimo(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+size_t ggml_mamba3_mimo_work_size(const struct ggml_tensor * op, int n_threads);
+void ggml_compute_forward_geodesic(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_olala_moe(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+size_t ggml_olala_moe_work_size(const struct ggml_tensor * op, int n_threads);
+void ggml_compute_forward_olala_mmv(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_olala_tpa_prep(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_olala_diff_gate(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_olala_tpa_attn(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_olala_tpa_expand(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_map_custom1(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_map_custom2(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_map_custom3(const struct ggml_compute_params * params, struct ggml_tensor * dst);

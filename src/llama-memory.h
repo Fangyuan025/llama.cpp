@@ -29,6 +29,9 @@ struct llama_memory_params {
 
     // only simulate the memory allocations
     bool no_alloc;
+
+    // TPA attention layers (Olala): the KV cache keeps the TPA factors (llama_tpa_cache_type)
+    bool tpa_factored;
 };
 
 // the tensor contexts and backend buffers of a memory instance

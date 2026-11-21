@@ -66,6 +66,7 @@
 #include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/gated_delta_net.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
+#include "ggml-cuda/mamba3-mimo.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
@@ -447,6 +448,18 @@ static ggml_cuda_device_info ggml_cuda_init() {
             info.devices[id].prefer_fp32_acc = should_use_fp32_acc(prop, info.devices[id].cc);
         } else {
             info.devices[id].prefer_fp32_acc = info.devices[physical_id].prefer_fp32_acc;
+        }
+        // Some CUDA-toolkit / driver combinations return a corrupt
+        // sharedMemPerBlockOptin in cudaDeviceProp (observed: 0x100000001 on
+        // H100 under CUDA 13.2). Cross-check via the attribute API and fix up
+        // if they disagree — the attribute is the authoritative source.
+        {
+            int smpbo_attr = 0;
+            if (cudaDeviceGetAttribute(&smpbo_attr, cudaDevAttrMaxSharedMemoryPerBlockOptin, id) == cudaSuccess) {
+                if ((size_t) smpbo_attr != info.devices[id].smpbo) {
+                    info.devices[id].smpbo = (size_t) smpbo_attr;
+                }
+            }
         }
         GGML_LOG_INFO("  Device %d: %s, compute capability %d.%d, VMM: %s, VRAM: %zu MiB\n",
                       id, prop.name, prop.major, prop.minor, device_vmm ? "yes" : "no",
@@ -2122,6 +2135,15 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     }
 }
 
+// [TAG_GGML_PREC] src1 must not go below bf16 (activations beyond the half range): do not use the kernels with fp16 scales
+static bool ggml_cuda_mul_mat_src1_wide(const ggml_tensor * src0, const ggml_tensor * dst) {
+    if (!ggml_is_quantized(src0->type)) {
+        return false;
+    }
+    const ggml_prec prec = (ggml_prec) ggml_get_op_params_i32(dst, 3);
+    return prec == GGML_PREC_F32 || prec == GGML_PREC_BF16;
+}
+
 static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     const ggml_prec prec = ggml_prec_get_acc(dst);
@@ -2142,6 +2164,9 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
         }
     }
     // F16 is the only compute type that can not satisfy a request for BF16
+    if (ggml_cuda_mul_mat_src1_wide(src0, dst) && compute_type == GGML_TYPE_F16) {
+        compute_type = fast_bf16_hardware_available(cc) ? GGML_TYPE_BF16 : GGML_TYPE_F32;
+    }
     if (prec == GGML_PREC_BF16 && compute_type == GGML_TYPE_F16) {
         compute_type = fast_bf16_hardware_available(cc) ? GGML_TYPE_BF16 : GGML_TYPE_F32;
     } else if (prec == GGML_PREC_F32) {
@@ -2345,6 +2370,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     bool use_mul_mat_vec_q = ggml_cuda_should_use_mmvq(src0->type, cc, src1->ne[1]) && !bad_padding_clear &&
                              src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
+
+    if (ggml_cuda_mul_mat_src1_wide(src0, dst)) {
+        return false;
+    }
 
     // fusion is not universally faster on Pascal
     if (cc < GGML_CUDA_CC_VOLTA) {
@@ -2576,6 +2605,14 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
     }
+    if (ggml_cuda_mul_mat_src1_wide(src0, dst)) {
+        if (ggml_cuda_mmq_has_f32_scale(src0->type) && ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
+            ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+        } else {
+            ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+        }
+        return;
+    }
     // from a per-type number of src1 columns up to 24, few-row MMQ is faster than MMVQ and MMQ
     const bool use_mmq_few = ggml_cuda_should_use_mmq_few(src0, src1, nullptr, cc);
     if (!use_mmq_few && ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
@@ -2605,6 +2642,11 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
 
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return true;
+    }
+
+    if (ggml_cuda_mul_mat_src1_wide(src0, dst)) {
+        return !(ggml_cuda_mmq_has_f32_scale(src0->type) &&
+                 ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], /*n_experts=*/src0->ne[2]));
     }
 
     if (dst->ne[2] <= MMVQ_MAX_BATCH_SIZE) {
@@ -2649,7 +2691,14 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
-    if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+    const bool src1_wide = ggml_cuda_mul_mat_src1_wide(src0, dst);
+    if (src1_wide) {
+        if (ggml_cuda_mmq_has_f32_scale(src0->type) && ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+            ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
+            return;
+        }
+        // else: per-expert products below (cuBLAS on the dequantized expert slices)
+    } else if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         // up to 24 tokens few-row MMQ is faster than MMQ, on DGX Spark also faster than MMVQ
         const bool use_mmq_few = ggml_cuda_should_use_mmq_few(src0, src1, ids, cc);
 
@@ -3134,6 +3183,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_DSV4_HC_POST:
             ggml_cuda_op_dsv4_hc_post(ctx, dst);
+            break;
+        case GGML_OP_MAMBA3_MIMO:
+            ggml_cuda_op_mamba3_mimo(ctx, dst);
+            break;
+        case GGML_OP_GEODESIC:
+            ggml_cuda_op_geodesic(ctx, dst);
             break;
         case GGML_OP_RWKV_WKV7:
             ggml_cuda_op_rwkv_wkv7(ctx, dst);
@@ -6809,6 +6864,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                 op->type == GGML_TYPE_F32;
+        case GGML_OP_MAMBA3_MIMO:
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[8] == nullptr && op->src[4]->ne[1] <= 8 &&
+                (op->src[4]->ne[1] & (op->src[4]->ne[1] - 1)) == 0;
+        case GGML_OP_GEODESIC:
+            return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
         case GGML_OP_CROSS_ENTROPY_LOSS:

@@ -2121,6 +2121,38 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_top_k_mask(params, tensor);
             } break;
+        case GGML_OP_MAMBA3_MIMO:
+            {
+                ggml_compute_forward_mamba3_mimo(params, tensor);
+            } break;
+        case GGML_OP_GEODESIC:
+            {
+                ggml_compute_forward_geodesic(params, tensor);
+            } break;
+        case GGML_OP_OLALA_MOE:
+            {
+                ggml_compute_forward_olala_moe(params, tensor);
+            } break;
+        case GGML_OP_OLALA_MMV:
+            {
+                ggml_compute_forward_olala_mmv(params, tensor);
+            } break;
+        case GGML_OP_OLALA_TPA_PREP:
+            {
+                ggml_compute_forward_olala_tpa_prep(params, tensor);
+            } break;
+        case GGML_OP_OLALA_DIFF_GATE:
+            {
+                ggml_compute_forward_olala_diff_gate(params, tensor);
+            } break;
+        case GGML_OP_OLALA_TPA_ATTN:
+            {
+                ggml_compute_forward_olala_tpa_attn(params, tensor);
+            } break;
+        case GGML_OP_OLALA_TPA_EXPAND:
+            {
+                ggml_compute_forward_olala_tpa_expand(params, tensor);
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2304,6 +2336,14 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
         case GGML_OP_TOP_K_MASK:
+        case GGML_OP_MAMBA3_MIMO:
+        case GGML_OP_GEODESIC:
+        case GGML_OP_OLALA_MOE:
+        case GGML_OP_OLALA_MMV:
+        case GGML_OP_OLALA_TPA_PREP:
+        case GGML_OP_OLALA_DIFF_GATE:
+        case GGML_OP_OLALA_TPA_ATTN:
+        case GGML_OP_OLALA_TPA_EXPAND:
             {
                 n_tasks = n_threads;
             } break;
@@ -3000,17 +3040,18 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_FLASH_ATTN_EXT:
                     {
                         const int64_t neq2 = node->src[0]->ne[2]; // number of query heads
+                        const int64_t neq3 = node->src[0]->ne[3]; // number of sequence streams
                         const int64_t DK = node->src[1]->ne[0];
                         const int64_t DV = node->src[2]->ne[0];
 
                         // Tiled flash attention scratch (tile sizes defined in common.h)
-                        // Per-thread: Q_q + KQ + mask + VKQ32 + V32 + K_f32 + padding
-                        size_t prefill  = sizeof(float)*(GGML_FA_TILE_Q*DK + 2*GGML_FA_TILE_Q*GGML_FA_TILE_KV + GGML_FA_TILE_Q*DV + GGML_FA_TILE_KV*DV + GGML_FA_TILE_KV*DK)*n_tasks;
+                        // Per-thread: Q_all + VKQ_all (QGROUP tiles each) + KQ + mask + V32 + K_f32 + padding
+                        size_t prefill  = sizeof(float)*(GGML_FA_TILE_QGROUP*GGML_FA_TILE_Q*(DK + DV) + 2*GGML_FA_TILE_Q*GGML_FA_TILE_KV + GGML_FA_TILE_KV*DV + GGML_FA_TILE_KV*DK)*n_tasks;
 
                         // Decode path: n_kv_chunks = n_tasks (one chunk per thread)
-                        // Per-thread: VKQ accmulator (DV), partial M, partial S + intra-thread scratch for V, Q and VKQ
+                        // Partials for every (stream, head) row + intra-thread scratch for V, Q and VKQ
                         size_t n_chunks = n_tasks;
-                        size_t decode   = sizeof(float)*(neq2*n_chunks*(2+DV) + n_tasks*(DK + 2*DV));
+                        size_t decode   = sizeof(float)*(neq2*neq3*n_chunks*(2+DV) + n_tasks*(DK + 2*DV));
 
                         cur += MAX(prefill, decode);
                     } break;
@@ -3034,6 +3075,32 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_CROSS_ENTROPY_LOSS:
                     {
                         cur = ggml_type_size(node->type)*(n_tasks + node->src[0]->ne[0]*n_tasks);
+                    } break;
+                case GGML_OP_MAMBA3_MIMO:
+                    {
+                        cur = ggml_mamba3_mimo_work_size(node, n_tasks);
+                    } break;
+                case GGML_OP_OLALA_MOE:
+                    {
+                        cur = ggml_olala_moe_work_size(node, n_tasks);
+                    } break;
+                case GGML_OP_OLALA_MMV:
+                    {
+                        // one dequantized weight row per thread
+                        cur = sizeof(float)*(node->src[0]->ne[0] + CACHE_LINE_SIZE_F32)*n_tasks;
+                    } break;
+                case GGML_OP_OLALA_TPA_PREP:
+                    {
+                        // 5 rows of Dh floats per thread
+                        const int64_t Dh = ggml_get_op_params_i32(node, 3);
+                        cur = sizeof(float)*(5*Dh + CACHE_LINE_SIZE_F32)*n_tasks;
+                    } break;
+                case GGML_OP_OLALA_TPA_ATTN:
+                    {
+                        // per thread: R dot products per cell, the scores, the output row
+                        const int64_t R    = ggml_get_op_params_i32(node, 1);
+                        const int64_t n_kv = node->src[1]->ne[1];
+                        cur = sizeof(float)*((R + 1)*n_kv + node->src[0]->ne[0] + CACHE_LINE_SIZE_F32)*n_tasks;
                     } break;
                 case GGML_OP_GATED_DELTA_NET:
                     {
@@ -3072,6 +3139,106 @@ struct ggml_cplan ggml_graph_plan(
     return cplan;
 }
 
+
+// ---- lightweight per-op profiler, enabled with GGML_OP_PROFILE=1 ----
+// Times each node on thread 0 (including the closing barrier, so per-node
+// thread-sync cost is attributed to the node). Results printed at exit.
+
+#define GGML_PROF_MAX_NAMES 512
+
+struct ggml_prof_entry {
+    char   name[2*GGML_MAX_NAME]; // "op(node name)"
+    double us;
+    int64_t n;
+};
+
+static struct {
+    int    enabled; // -1 = unknown, 0 = off, 1 = on
+    double op_us[GGML_OP_COUNT];
+    int64_t op_n[GGML_OP_COUNT];
+    struct ggml_prof_entry names[GGML_PROF_MAX_NAMES];
+    int    n_names;
+    double total_us;
+    int64_t total_nodes;
+    int64_t n_graphs;
+} g_ggml_prof = { -1, {0}, {0}, {{{0}, 0, 0}}, 0, 0.0, 0, 0 };
+
+static void ggml_prof_print(void) {
+    if (g_ggml_prof.enabled != 1 || g_ggml_prof.total_nodes == 0) {
+        return;
+    }
+    fprintf(stderr, "\n== ggml CPU op profile: %lld graphs, %lld nodes, %.1f ms total ==\n",
+            (long long) g_ggml_prof.n_graphs, (long long) g_ggml_prof.total_nodes, g_ggml_prof.total_us / 1000.0);
+    fprintf(stderr, "%-24s %12s %10s %8s\n", "op", "time(ms)", "count", "%");
+    for (;;) {
+        int best = -1;
+        double best_us = 0.0;
+        for (int i = 0; i < GGML_OP_COUNT; i++) {
+            if (g_ggml_prof.op_us[i] > best_us) { best_us = g_ggml_prof.op_us[i]; best = i; }
+        }
+        if (best < 0 || best_us < g_ggml_prof.total_us * 0.002) break;
+        fprintf(stderr, "%-24s %12.1f %10lld %7.1f%%\n", ggml_op_name((enum ggml_op) best),
+                best_us / 1000.0, (long long) g_ggml_prof.op_n[best], 100.0 * best_us / g_ggml_prof.total_us);
+        g_ggml_prof.op_us[best] = -g_ggml_prof.op_us[best]; // mark printed
+    }
+    for (int i = 0; i < GGML_OP_COUNT; i++) {
+        if (g_ggml_prof.op_us[i] < 0) g_ggml_prof.op_us[i] = -g_ggml_prof.op_us[i];
+    }
+    const char * top_env = getenv("GGML_OP_PROFILE_TOP");
+    const int n_top = top_env ? atoi(top_env) : 40;
+    fprintf(stderr, "-- by tensor name (top %d) --\n", n_top);
+    for (int k = 0; k < n_top; k++) {
+        int best = -1;
+        double best_us = 0.0;
+        for (int i = 0; i < g_ggml_prof.n_names; i++) {
+            if (g_ggml_prof.names[i].us > best_us) { best_us = g_ggml_prof.names[i].us; best = i; }
+        }
+        if (best < 0 || (!top_env && best_us < g_ggml_prof.total_us * 0.002)) break;
+        fprintf(stderr, "%-40s %12.1f %10lld %7.1f%%\n", g_ggml_prof.names[best].name,
+                g_ggml_prof.names[best].us / 1000.0, (long long) g_ggml_prof.names[best].n,
+                100.0 * best_us / g_ggml_prof.total_us);
+        g_ggml_prof.names[best].us = -g_ggml_prof.names[best].us;
+    }
+    for (int i = 0; i < g_ggml_prof.n_names; i++) {
+        if (g_ggml_prof.names[i].us < 0) g_ggml_prof.names[i].us = -g_ggml_prof.names[i].us;
+    }
+}
+
+static void ggml_prof_node(const struct ggml_tensor * node, int n_nodes, double us) {
+    g_ggml_prof.op_us[node->op] += us;
+    g_ggml_prof.op_n[node->op]  += 1;
+    g_ggml_prof.total_us        += us;
+    g_ggml_prof.total_nodes     += n_nodes;
+
+    // normalize name: strip trailing "-<digits>" / "_<digits>" so per-layer
+    // tensors aggregate ("ffn_moe_out-31" -> "ffn_moe_out")
+    char key[2*GGML_MAX_NAME];
+    snprintf(key, sizeof(key), "%s(%s)", ggml_op_name(node->op), node->name);
+    size_t len = strlen(key);
+    // (length-1 guard: never strip the leading char)
+    {
+        size_t e = len - 1; // last char is ')'
+        size_t i = e;
+        while (i > 1 && key[i-1] >= '0' && key[i-1] <= '9') i--;
+        if (i < e && i > 1 && (key[i-1] == '-' || key[i-1] == '_')) {
+            key[i-1] = ')';
+            key[i]   = '\0';
+        }
+    }
+    for (int i = 0; i < g_ggml_prof.n_names; i++) {
+        if (strcmp(g_ggml_prof.names[i].name, key) == 0) {
+            g_ggml_prof.names[i].us += us;
+            g_ggml_prof.names[i].n  += 1;
+            return;
+        }
+    }
+    if (g_ggml_prof.n_names < GGML_PROF_MAX_NAMES) {
+        struct ggml_prof_entry * e = &g_ggml_prof.names[g_ggml_prof.n_names++];
+        snprintf(e->name, sizeof(e->name), "%s", key);
+        e->us = us;
+        e->n  = 1;
+    }
+}
 
 // Try to fuse the current node with subsequent nodes for better performance.
 // Returns the number of nodes skipped by fusion (>=1), or 0 if no fusion was applied.
@@ -3139,6 +3306,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
 #endif
 
+    const bool prof = g_ggml_prof.enabled == 1 && state->ith == 0;
+    if (prof) {
+        g_ggml_prof.n_graphs++;
+    }
+
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
@@ -3150,6 +3322,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
         }
+
+        const int64_t t_prof_0 = prof ? ggml_time_us() : 0;
 
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
@@ -3168,6 +3342,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
+        }
+
+        if (prof) {
+            // includes the barrier, so per-node sync cost lands on the node
+            ggml_prof_node(node, n_fused + 1, (double) (ggml_time_us() - t_prof_0));
         }
     }
 
@@ -3947,6 +4126,12 @@ void ggml_cpu_init(void) {
         {
             const char * env = getenv("GGML_CPU_DISABLE_FUSION");
             ggml_cpu_disable_fusion = (env != NULL && atoi(env) == 1);
+
+            const char * prof_env = getenv("GGML_OP_PROFILE");
+            g_ggml_prof.enabled = (prof_env != NULL && atoi(prof_env) == 1) ? 1 : 0;
+            if (g_ggml_prof.enabled == 1) {
+                atexit(ggml_prof_print);
+            }
         }
 
         is_first_call = false;

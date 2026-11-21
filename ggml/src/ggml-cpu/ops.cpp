@@ -5,12 +5,15 @@
 #include "binary-ops.h"
 #include "simd-gemm.h"
 #include "ggml.h"
+#include "quants.h"
 #include "unary-ops.h"
 #include "vec.h"
+#include "olala-pager.h"
 
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <vector>
 
 // ggml_compute_forward_dup
 
@@ -1731,10 +1734,6 @@ static void ggml_compute_forward_repeat_f32(
 
     const ggml_tensor * src0 = dst->src[0];
 
-    if (params->ith != 0) {
-        return;
-    }
-
     GGML_ASSERT(ggml_can_repeat(src0, dst));
 
     GGML_TENSOR_UNARY_OP_LOCALS
@@ -1749,22 +1748,24 @@ static void ggml_compute_forward_repeat_f32(
     GGML_ASSERT(nb0  == sizeof(float));
     GGML_ASSERT(nb00 == sizeof(float));
 
-    // TODO: maybe this is not optimal?
-    for                         (int i3 = 0; i3 < nr3;  i3++) {
-        for                     (int k3 = 0; k3 < ne03; k3++) {
-            for                 (int i2 = 0; i2 < nr2;  i2++) {
-                for             (int k2 = 0; k2 < ne02; k2++) {
-                    for         (int i1 = 0; i1 < nr1;  i1++) {
-                        for     (int k1 = 0; k1 < ne01; k1++) {
-                            for (int i0 = 0; i0 < nr0;  i0++) {
-                                ggml_vec_cpy_f32(ne00,
-                                        (float *) ((char *)  dst->data + (i3*ne03 + k3)*nb3  + (i2*ne02 + k2)*nb2  + (i1*ne01 + k1)*nb1  + (i0*ne00)*nb0),
-                                        (float *) ((char *) src0->data + (          k3)*nb03 + (          k2)*nb02 + (          k1)*nb01));
-                            }
-                        }
-                    }
-                }
-            }
+    // parallelize over dst rows: flatten (i3,k3,i2,k2,i1,k1) into one index
+    const int64_t nrows = (int64_t) nr3*ne03*nr2*ne02*nr1*ne01;
+    const int64_t dr = (nrows + params->nth - 1)/params->nth;
+    const int64_t r0 = dr*params->ith;
+    const int64_t r1 = MIN(r0 + dr, nrows);
+
+    for (int64_t r = r0; r < r1; ++r) {
+        int64_t tmp = r;
+        const int64_t k1 = tmp % ne01; tmp /= ne01;
+        const int64_t i1 = tmp % nr1;  tmp /= nr1;
+        const int64_t k2 = tmp % ne02; tmp /= ne02;
+        const int64_t i2 = tmp % nr2;  tmp /= nr2;
+        const int64_t k3 = tmp % ne03; tmp /= ne03;
+        const int64_t i3 = tmp;
+        for (int i0 = 0; i0 < nr0; i0++) {
+            ggml_vec_cpy_f32(ne00,
+                    (float *) ((char *)  dst->data + (i3*ne03 + k3)*nb3  + (i2*ne02 + k2)*nb2  + (i1*ne01 + k1)*nb1  + (i0*ne00)*nb0),
+                    (float *) ((char *) src0->data + (          k3)*nb03 + (          k2)*nb02 + (          k1)*nb01));
         }
     }
 }
@@ -5418,6 +5419,36 @@ static void ggml_compute_forward_get_rows_f32(
 
     const int ith = params->ith;
     const int nth = params->nth;
+
+    if (nr < nth && nc >= 4096) {
+        // fewer rows than threads and the rows are large (e.g. recurrent-state
+        // rows gathered once per token): split each row across several threads
+        // instead of leaving all but nr threads idle
+        const int tpr = (nth + nr - 1)/nr; // threads per row
+        const int64_t i = ith/tpr;         // row for this thread
+        const int sub   = ith%tpr;         // chunk of the row for this thread
+        if (i >= nr) {
+            return;
+        }
+        const int64_t dc  = (nc + tpr - 1)/tpr;
+        const int64_t ic0 = dc*sub;
+        const int64_t ic1 = MIN(ic0 + dc, nc);
+        if (ic0 >= ic1) {
+            return;
+        }
+
+        const int64_t i12 = i/(ne11*ne10);
+        const int64_t i11 = (i - i12*ne11*ne10)/ne10;
+        const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
+        const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
+
+        GGML_ASSERT(i01 >= 0 && i01 < ne01);
+
+        ggml_vec_cpy_f32(ic1 - ic0,
+                (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3)  + ic0,
+                (float *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03) + ic0);
+        return;
+    }
 
     // rows per thread
     const int dr = (nr + nth - 1)/nth;
@@ -11873,6 +11904,1500 @@ void ggml_compute_forward_top_k_mask(
     }
 }
 
+// read prefetch hint, low temporal locality (MSVC has no __builtin_prefetch)
+#if defined(__GNUC__) || defined(__clang__)
+#define OLALA_PREFETCH_L2(p) __builtin_prefetch((p), 0, 1)
+#elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+#define OLALA_PREFETCH_L2(p) _mm_prefetch((const char *) (p), _MM_HINT_T1)
+#else
+#define OLALA_PREFETCH_L2(p) ((void) (p))
+#endif
+
+// ggml_compute_forward_mamba3_mimo
+//
+// fused Olala Mamba3-MIMO mixer core (see ggml.h). Work unit = one head; a
+// thread owns a fixed set of heads for ALL sequences of the batch, serial over
+// tokens, so the per-head state is updated in place in its destination row:
+//   - result mode:   the state comes from src[7] (gathered rows) and the new
+//                    state is written after y in dst (all backends);
+//   - in-place mode: src[7] is the whole recurrent cache, src[8] the I32
+//                    source-row ids and src[9] the destination rows (CPU only).
+//                    A sequence whose source row differs from its destination
+//                    (new sequence -> shared zero row, moved cell) is
+//                    snapshotted before the first write: all slices of a head
+//                    belong to one thread, so the update is race-free.
+// Tokens are processed in groups of up to M3_TB so the state sweep (the
+// dominant traffic) runs once per group.
+
+#define M3_TB 4
+
+#if defined(GGML_SIMD) && !defined(__ARM_FEATURE_SVE) && !defined(__riscv_v_intrinsic)
+#define M3_SIMD 1
+static inline float m3_hsum(GGML_F32_VEC v) {
+#if defined(__AVX512F__)
+    return _mm512_reduce_add_ps(v);
+#else
+    float tmp[GGML_F32_EPR];
+    GGML_F32_VEC_STORE(tmp, v);
+    float s = 0.0f;
+    for (int i = 0; i < GGML_F32_EPR; ++i) {
+        s += tmp[i];
+    }
+    return s;
+#endif
+}
+#endif
+
+static inline float m3_softplus(float x) {
+    return (x > 0.0f ? x : 0.0f) + logf(expf(-fabsf(x)) + 1.0f);
+}
+
+// sin/cos for |x| <= ~pi: Cephes minimax on [-pi/4, pi/4] + quadrant fix-up
+static void m3_sincos_n(const float * x, float * s, float * c, int64_t n) {
+    int64_t i = 0;
+#if defined(__AVX512F__)
+    for (; i + 16 <= n; i += 16) {
+        const __m512 xv = _mm512_loadu_ps(x + i);
+        const __m512 j  = _mm512_roundscale_ps(_mm512_mul_ps(xv, _mm512_set1_ps(0.63661977236758134f)),
+                                               _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+        __m512 r = _mm512_fnmadd_ps(j, _mm512_set1_ps(1.5703125f), xv);
+        r = _mm512_fnmadd_ps(j, _mm512_set1_ps(4.837512969970703125e-4f), r);
+        r = _mm512_fnmadd_ps(j, _mm512_set1_ps(7.54978995489188216e-8f), r);
+        const __m512 r2 = _mm512_mul_ps(r, r);
+        __m512 sp = _mm512_fmadd_ps(_mm512_set1_ps(-1.9515295891e-4f), r2, _mm512_set1_ps(8.3321608736e-3f));
+        sp = _mm512_fmadd_ps(sp, r2, _mm512_set1_ps(-1.6666654611e-1f));
+        sp = _mm512_fmadd_ps(_mm512_mul_ps(sp, r2), r, r);
+        __m512 cp = _mm512_fmadd_ps(_mm512_set1_ps(2.443315711809948e-5f), r2, _mm512_set1_ps(-1.388731625493765e-3f));
+        cp = _mm512_fmadd_ps(cp, r2, _mm512_set1_ps(4.166664568298827e-2f));
+        cp = _mm512_fmadd_ps(_mm512_mul_ps(cp, r2), r2, _mm512_fnmadd_ps(_mm512_set1_ps(0.5f), r2, _mm512_set1_ps(1.0f)));
+        const __m512i q = _mm512_and_si512(_mm512_cvtps_epi32(j), _mm512_set1_epi32(3));
+        const __mmask16 swap = _mm512_test_epi32_mask(q, _mm512_set1_epi32(1));
+        const __mmask16 sneg = _mm512_test_epi32_mask(q, _mm512_set1_epi32(2));
+        const __mmask16 cneg = _mm512_cmp_epi32_mask(_mm512_add_epi32(q, _mm512_set1_epi32(1)), _mm512_set1_epi32(1), _MM_CMPINT_NLE) &
+                               _mm512_cmp_epi32_mask(q, _mm512_set1_epi32(3), _MM_CMPINT_LT);
+        __m512 sv = _mm512_mask_blend_ps(swap, sp, cp);
+        __m512 cv = _mm512_mask_blend_ps(swap, cp, sp);
+        sv = _mm512_mask_xor_ps(sv, sneg, sv, _mm512_set1_ps(-0.0f));
+        cv = _mm512_mask_xor_ps(cv, cneg, cv, _mm512_set1_ps(-0.0f));
+        _mm512_storeu_ps(s + i, sv);
+        _mm512_storeu_ps(c + i, cv);
+    }
+#endif
+    for (; i < n; ++i) {
+        const float j  = nearbyintf(x[i]*0.63661977236758134f);
+        float r = x[i] - j*1.5703125f;
+        r -= j*4.837512969970703125e-4f;
+        r -= j*7.54978995489188216e-8f;
+        const float r2 = r*r;
+        const float sp = r + r*r2*(-1.6666654611e-1f + r2*(8.3321608736e-3f + r2*(-1.9515295891e-4f)));
+        const float cp = 1.0f - 0.5f*r2 + r2*r2*(4.166664568298827e-2f + r2*(-1.388731625493765e-3f + r2*2.443315711809948e-5f));
+        const int q = (int) j & 3;
+        float ss = (q & 1) ? cp : sp;
+        float cc = (q & 1) ? sp : cp;
+        if (q & 2)           ss = -ss;
+        if (q == 1 || q == 2) cc = -cc;
+        s[i] = ss;
+        c[i] = cc;
+    }
+}
+
+// state sweep for TB tokens, gate-folded: w = silu(z)*mimo_o, y pre-seeded with
+// the D skip, so y[p] += sum_d S[p,d] * sum_r w[r,p] q_r[d] (one reduction per
+// row); token tt's kv is token tt+1's kv_prev
+template <int RC, int TB>
+static void m3_step(
+        float * GGML_RESTRICT st, const float * K_st, const float * V_st,
+        const float * const * k, const float * const * q, const float * const * v, const float * const * w,
+        float * const * y, const float * alpha, const float * beta, const float * gamma,
+        int64_t D_qk, int64_t D_v) {
+#if defined(M3_SIMD)
+    if (D_qk % GGML_F32_EPR == 0) {
+        for (int64_t p = 0; p < D_v; ++p) {
+            float * st_row = st + p*D_qk;
+            GGML_F32_VEC acc[TB];
+            for (int tt = 0; tt < TB; ++tt) {
+                acc[tt] = GGML_F32_VEC_ZERO;
+            }
+            for (int64_t d = 0; d < D_qk; d += GGML_F32_EPR) {
+                GGML_F32_VEC s   = GGML_F32_VEC_LOAD(st_row + d);
+                GGML_F32_VEC kvp = GGML_F32_VEC_ZERO;
+                for (int r = 0; r < RC; ++r) {
+                    kvp = GGML_F32_VEC_FMA(kvp, GGML_F32_VEC_SET1(V_st[r*D_v + p]), GGML_F32_VEC_LOAD(K_st + r*D_qk + d));
+                }
+                for (int tt = 0; tt < TB; ++tt) {
+                    GGML_F32_VEC kv = GGML_F32_VEC_ZERO;
+                    GGML_F32_VEC qw = GGML_F32_VEC_ZERO;
+                    for (int r = 0; r < RC; ++r) {
+                        kv = GGML_F32_VEC_FMA(kv, GGML_F32_VEC_SET1(v[tt][r*D_v + p]), GGML_F32_VEC_LOAD(k[tt] + r*D_qk + d));
+                        qw = GGML_F32_VEC_FMA(qw, GGML_F32_VEC_SET1(w[tt][r*D_v + p]), GGML_F32_VEC_LOAD(q[tt] + r*D_qk + d));
+                    }
+                    s = GGML_F32_VEC_MUL(GGML_F32_VEC_SET1(alpha[tt]), s);
+                    s = GGML_F32_VEC_FMA(s, GGML_F32_VEC_SET1(beta[tt]),  kvp);
+                    s = GGML_F32_VEC_FMA(s, GGML_F32_VEC_SET1(gamma[tt]), kv);
+                    acc[tt] = GGML_F32_VEC_FMA(acc[tt], s, qw);
+                    kvp = kv;
+                }
+                GGML_F32_VEC_STORE(st_row + d, s);
+            }
+            for (int tt = 0; tt < TB; ++tt) {
+                y[tt][p] += m3_hsum(acc[tt]);
+            }
+        }
+        return;
+    }
+#endif
+    for (int64_t p = 0; p < D_v; ++p) {
+        float * st_row = st + p*D_qk;
+        float acc[TB] = {};
+        for (int64_t d = 0; d < D_qk; ++d) {
+            float s = st_row[d];
+            float kvp = 0.0f;
+            for (int r = 0; r < RC; ++r) {
+                kvp += V_st[r*D_v + p]*K_st[r*D_qk + d];
+            }
+            for (int tt = 0; tt < TB; ++tt) {
+                float kv = 0.0f, qw = 0.0f;
+                for (int r = 0; r < RC; ++r) {
+                    kv += v[tt][r*D_v + p]*k[tt][r*D_qk + d];
+                    qw += w[tt][r*D_v + p]*q[tt][r*D_qk + d];
+                }
+                s = alpha[tt]*s + beta[tt]*kvp + gamma[tt]*kv;
+                acc[tt] += s*qw;
+                kvp = kv;
+            }
+            st_row[d] = s;
+        }
+        for (int tt = 0; tt < TB; ++tt) {
+            y[tt][p] += acc[tt];
+        }
+    }
+}
+
+template <int RC>
+static void m3_step_tb(
+        float * st, const float * K_st, const float * V_st,
+        const float * const * k, const float * const * q, const float * const * v, const float * const * w,
+        float * const * y, const float * alpha, const float * beta, const float * gamma,
+        int64_t TB, int64_t D_qk, int64_t D_v) {
+    switch (TB) {
+        case 4: m3_step<RC, 4>(st, K_st, V_st, k, q, v, w, y, alpha, beta, gamma, D_qk, D_v); break;
+        case 3: m3_step<RC, 3>(st, K_st, V_st, k, q, v, w, y, alpha, beta, gamma, D_qk, D_v); break;
+        case 2: m3_step<RC, 2>(st, K_st, V_st, k, q, v, w, y, alpha, beta, gamma, D_qk, D_v); break;
+        default: m3_step<RC, 1>(st, K_st, V_st, k, q, v, w, y, alpha, beta, gamma, D_qk, D_v); break;
+    }
+}
+
+static void m3_step_dispatch(
+        float * st, const float * K_st, const float * V_st,
+        const float * const * k, const float * const * q, const float * const * v, const float * const * w,
+        float * const * y, const float * alpha, const float * beta, const float * gamma,
+        int64_t R, int64_t TB, int64_t D_qk, int64_t D_v) {
+    switch (R) {
+        case 1: m3_step_tb<1>(st, K_st, V_st, k, q, v, w, y, alpha, beta, gamma, TB, D_qk, D_v); break;
+        case 2: m3_step_tb<2>(st, K_st, V_st, k, q, v, w, y, alpha, beta, gamma, TB, D_qk, D_v); break;
+        case 4: m3_step_tb<4>(st, K_st, V_st, k, q, v, w, y, alpha, beta, gamma, TB, D_qk, D_v); break;
+        case 8: m3_step_tb<8>(st, K_st, V_st, k, q, v, w, y, alpha, beta, gamma, TB, D_qk, D_v); break;
+        default: GGML_ABORT("mamba3_mimo: unsupported MIMO rank %d", (int) R);
+    }
+}
+
+// Prefill path (T >= M3_PREFILL_T tokens per sequence): the state is swept
+// d-major (U[d][p], p contiguous) one token at a time with the rank-R
+// operands k/q broadcast and v/accumulators held in registers, so the
+// output needs no horizontal reductions. The trapezoid term is folded into
+// the state with the "shifted gamma" identity of the chunked reference:
+//   U_t = S_t + delta_t kv_t,  delta_t = (1 - trap_{t+1}) dt_{t+1}  (0 on the last token)
+//   U_t = alpha_t U_{t-1} + (gamma_t + delta_t) kv_t
+//   y_t = q_t^T S_t = q_t^T U_t - delta_t sum_r' v_r' (k_r' . q_r)
+// 10 FMA-port ops per state element and token instead of 13, and no
+// kv_prev recomputation. S is transposed into the thread's scratch at the
+// start of the batch and back at the end.
+#define M3_PREFILL_T 4
+
+template <int R, int NVB>
+static void m3_prefill_token(
+        float * GGML_RESTRICT U, const float * k, const float * q, const float * v, float * o,
+        float alpha, float c, int64_t D_qk, int64_t D_v) {
+#if defined(M3_SIMD)
+    if (D_v % (NVB*GGML_F32_EPR) == 0) {
+        const GGML_F32_VEC av = GGML_F32_VEC_SET1(alpha);
+        const GGML_F32_VEC cv = GGML_F32_VEC_SET1(c);
+        for (int64_t p0 = 0; p0 < D_v; p0 += NVB*GGML_F32_EPR) {
+            GGML_F32_VEC vb[R][NVB];
+            GGML_F32_VEC acc[R][NVB];
+            for (int r = 0; r < R; ++r) {
+                for (int j = 0; j < NVB; ++j) {
+                    vb[r][j]  = GGML_F32_VEC_LOAD(v + r*D_v + p0 + j*GGML_F32_EPR);
+                    acc[r][j] = GGML_F32_VEC_ZERO;
+                }
+            }
+            for (int64_t d = 0; d < D_qk; ++d) {
+                float * Ud = U + d*D_v + p0;
+                GGML_F32_VEC kb[R], qb[R];
+                for (int r = 0; r < R; ++r) {
+                    kb[r] = GGML_F32_VEC_SET1(k[r*D_qk + d]);
+                    qb[r] = GGML_F32_VEC_SET1(q[r*D_qk + d]);
+                }
+                for (int j = 0; j < NVB; ++j) {
+                    GGML_F32_VEC s  = GGML_F32_VEC_LOAD(Ud + j*GGML_F32_EPR);
+                    GGML_F32_VEC kv = GGML_F32_VEC_MUL(kb[0], vb[0][j]);
+                    for (int r = 1; r < R; ++r) {
+                        kv = GGML_F32_VEC_FMA(kv, kb[r], vb[r][j]);
+                    }
+                    s = GGML_F32_VEC_FMA(GGML_F32_VEC_MUL(av, s), cv, kv);
+                    GGML_F32_VEC_STORE(Ud + j*GGML_F32_EPR, s);
+                    for (int r = 0; r < R; ++r) {
+                        acc[r][j] = GGML_F32_VEC_FMA(acc[r][j], qb[r], s);
+                    }
+                }
+            }
+            for (int r = 0; r < R; ++r) {
+                for (int j = 0; j < NVB; ++j) {
+                    GGML_F32_VEC_STORE(o + r*D_v + p0 + j*GGML_F32_EPR, acc[r][j]);
+                }
+            }
+        }
+        return;
+    }
+#endif
+    for (int r = 0; r < R; ++r) {
+        for (int64_t p = 0; p < D_v; ++p) {
+            o[r*D_v + p] = 0.0f;
+        }
+    }
+    for (int64_t d = 0; d < D_qk; ++d) {
+        float * Ud = U + d*D_v;
+        for (int64_t p = 0; p < D_v; ++p) {
+            float kv = 0.0f;
+            for (int r = 0; r < R; ++r) {
+                kv += k[r*D_qk + d]*v[r*D_v + p];
+            }
+            const float sn = alpha*Ud[p] + c*kv;
+            Ud[p] = sn;
+            for (int r = 0; r < R; ++r) {
+                o[r*D_v + p] += q[r*D_qk + d]*sn;
+            }
+        }
+    }
+}
+
+static void m3_prefill_token_dispatch(
+        float * U, const float * k, const float * q, const float * v, float * o,
+        float alpha, float c, int64_t R, int64_t D_qk, int64_t D_v) {
+#if defined(M3_SIMD) && GGML_F32_EPR >= 16
+    constexpr int NVB = 2;
+#else
+    constexpr int NVB = 1;
+#endif
+    switch (R) {
+        case 1: m3_prefill_token<1, NVB>(U, k, q, v, o, alpha, c, D_qk, D_v); break;
+        case 2: m3_prefill_token<2, NVB>(U, k, q, v, o, alpha, c, D_qk, D_v); break;
+        case 4: m3_prefill_token<4, NVB>(U, k, q, v, o, alpha, c, D_qk, D_v); break;
+        case 8: m3_prefill_token<8, NVB>(U, k, q, v, o, alpha, c, D_qk, D_v); break;
+        default: GGML_ABORT("mamba3_mimo: unsupported MIMO rank %d", (int) R);
+    }
+}
+
+
+// y = sum_r w_r * (o_r + D v_r - delta sum_r' v_r' G[r'][r]),  G[r'][r] = k_r' . q_r
+static void m3_prefill_epilogue(
+        float * yr, const float * o, const float * k, const float * q, const float * v, const float * w,
+        float * G, float D_h, float delta, int64_t R, int64_t D_qk, int64_t D_v) {
+#if defined(M3_SIMD)
+    if (D_qk % GGML_F32_EPR == 0 && D_v % GGML_F32_EPR == 0) {
+        if (delta != 0.0f && R <= 8) {
+            GGML_F32_VEC acc[8][8];
+            for (int64_t r2 = 0; r2 < R; ++r2) {
+                for (int64_t r = 0; r < R; ++r) {
+                    acc[r2][r] = GGML_F32_VEC_ZERO;
+                }
+            }
+            for (int64_t d = 0; d < D_qk; d += GGML_F32_EPR) {
+                GGML_F32_VEC kv[8], qv[8];
+                for (int64_t r = 0; r < R; ++r) {
+                    kv[r] = GGML_F32_VEC_LOAD(k + r*D_qk + d);
+                    qv[r] = GGML_F32_VEC_LOAD(q + r*D_qk + d);
+                }
+                for (int64_t r2 = 0; r2 < R; ++r2) {
+                    for (int64_t r = 0; r < R; ++r) {
+                        acc[r2][r] = GGML_F32_VEC_FMA(acc[r2][r], kv[r2], qv[r]);
+                    }
+                }
+            }
+            for (int64_t r2 = 0; r2 < R; ++r2) {
+                for (int64_t r = 0; r < R; ++r) {
+                    G[r2*R + r] = m3_hsum(acc[r2][r]);
+                }
+            }
+        } else if (delta != 0.0f) {
+            for (int64_t r2 = 0; r2 < R; ++r2) {
+                for (int64_t r = 0; r < R; ++r) {
+                    GGML_F32_VEC acc = GGML_F32_VEC_ZERO;
+                    for (int64_t d = 0; d < D_qk; d += GGML_F32_EPR) {
+                        acc = GGML_F32_VEC_FMA(acc, GGML_F32_VEC_LOAD(k + r2*D_qk + d), GGML_F32_VEC_LOAD(q + r*D_qk + d));
+                    }
+                    G[r2*R + r] = m3_hsum(acc);
+                }
+            }
+        }
+        const GGML_F32_VEC Dv = GGML_F32_VEC_SET1(D_h);
+        const GGML_F32_VEC nd = GGML_F32_VEC_SET1(-delta);
+        for (int64_t p = 0; p < D_v; p += GGML_F32_EPR) {
+            GGML_F32_VEC y = GGML_F32_VEC_ZERO;
+            for (int64_t r = 0; r < R; ++r) {
+                GGML_F32_VEC t = GGML_F32_VEC_FMA(GGML_F32_VEC_LOAD(o + r*D_v + p), Dv, GGML_F32_VEC_LOAD(v + r*D_v + p));
+                if (delta != 0.0f) {
+                    GGML_F32_VEC corr = GGML_F32_VEC_ZERO;
+                    for (int64_t r2 = 0; r2 < R; ++r2) {
+                        corr = GGML_F32_VEC_FMA(corr, GGML_F32_VEC_LOAD(v + r2*D_v + p), GGML_F32_VEC_SET1(G[r2*R + r]));
+                    }
+                    t = GGML_F32_VEC_FMA(t, nd, corr);
+                }
+                y = GGML_F32_VEC_FMA(y, GGML_F32_VEC_LOAD(w + r*D_v + p), t);
+            }
+            GGML_F32_VEC_STORE(yr + p, y);
+        }
+        return;
+    }
+#endif
+    if (delta != 0.0f) {
+        for (int64_t r2 = 0; r2 < R; ++r2) {
+            for (int64_t r = 0; r < R; ++r) {
+                float g = 0.0f;
+                for (int64_t d = 0; d < D_qk; ++d) {
+                    g += k[r2*D_qk + d]*q[r*D_qk + d];
+                }
+                G[r2*R + r] = g;
+            }
+        }
+    }
+    for (int64_t p = 0; p < D_v; ++p) {
+        float y = 0.0f;
+        for (int64_t r = 0; r < R; ++r) {
+            float corr = 0.0f;
+            if (delta != 0.0f) {
+                for (int64_t r2 = 0; r2 < R; ++r2) {
+                    corr += v[r2*D_v + p]*G[r2*R + r];
+                }
+            }
+            y += w[r*D_v + p]*(o[r*D_v + p] + D_h*v[r*D_v + p] - delta*corr);
+        }
+        yr[p] = y;
+    }
+}
+
+static bool m3_legacy_path(void) {
+    static const bool legacy = getenv("GGML_M3_LEGACY") != nullptr && atoi(getenv("GGML_M3_LEGACY")) != 0;
+    return legacy;
+}
+
+// work buffer: [shared per-token prep (n_tok x (2R D_qk + n_ang)) | per-thread scratch]
+static size_t m3_shared_floats(const ggml_tensor * op) {
+    const int64_t D_qk  = op->src[2]->ne[0];
+    const int64_t R     = op->src[4]->ne[1];
+    const int64_t n_tok = op->src[0]->ne[1];
+    return (size_t) n_tok*(2*R*D_qk + D_qk/4) + CACHE_LINE_SIZE_F32;
+}
+
+static size_t m3_thread_floats(const ggml_tensor * op, int n_threads) {
+    const int64_t D_qk  = op->src[2]->ne[0];
+    const int64_t R     = op->src[4]->ne[1];
+    const int64_t H     = op->src[4]->ne[2];
+    const int64_t D_v   = op->src[4]->ne[0];
+    const int64_t n_ang = D_qk/4;
+    const bool inplace  = op->src[8] != nullptr;
+    const int64_t n_seqs = inplace ? op->src[8]->ne[0] : op->src[7]->ne[1];
+    const int64_t per_unit = D_v*D_qk + R*D_qk + R*D_v + n_ang;
+    const int64_t units = (H + n_threads - 1)/n_threads;
+    const int64_t scratch = M3_TB*(2*R*D_qk + 2*R*D_v + 2*R*D_qk + n_ang) + 2*n_ang + D_v
+                          + D_qk*D_v + R*D_v + R*R;   // U (d-major state), o, G
+    return (size_t) (scratch + (inplace ? n_seqs*units*per_unit : 0) + CACHE_LINE_SIZE_F32);
+}
+
+size_t ggml_mamba3_mimo_work_size(const ggml_tensor * op, int n_threads) {
+    return (m3_shared_floats(op) + (size_t) n_threads*m3_thread_floats(op, n_threads))*sizeof(float);
+}
+
+static void ggml_compute_forward_mamba3_mimo_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * pdyn   = dst->src[0];
+    const ggml_tensor * pstat  = dst->src[1];
+    const ggml_tensor * bias   = dst->src[2];
+    const ggml_tensor * mxz    = dst->src[3];
+    const ggml_tensor * mimo_o = dst->src[4];
+    const ggml_tensor * norms  = dst->src[5];
+    const ggml_tensor * misc   = dst->src[6];
+    const ggml_tensor * states = dst->src[7];
+    const ggml_tensor * ids    = dst->src[8];
+    const ggml_tensor * sdst   = dst->src[9];
+    const bool inplace = ids != nullptr;
+
+    const float eps     = ggml_get_op_params_f32(dst, 0);
+    const float a_floor = ggml_get_op_params_f32(dst, 1);
+
+    const int64_t D_qk   = bias->ne[0];
+    const int64_t R      = mimo_o->ne[1];
+    const int64_t H      = mimo_o->ne[2];
+    const int64_t D_v    = mimo_o->ne[0];
+    const int64_t n_ang  = D_qk/4;
+    const int64_t n_tok  = pdyn->ne[1];
+    const int64_t n_seqs = inplace ? ids->ne[0] : states->ne[1];
+    const int64_t T      = n_tok/n_seqs;
+    const int64_t half   = D_qk/2;
+
+    const int64_t off_K    = H*D_v*D_qk;
+    const int64_t off_V    = off_K + H*R*D_qk;
+    const int64_t off_A    = off_V + H*R*D_v;
+    const int64_t n_embd_s = off_A + H*n_ang;
+    const int64_t per_unit = D_v*D_qk + R*D_qk + R*D_v + n_ang;
+
+    const float * bias_d  = (const float *) bias->data;
+    const float * mxz_d   = (const float *) mxz->data;
+    const float * mo_d    = (const float *) mimo_o->data;
+    const float * norms_d = (const float *) norms->data;
+    const float * misc_d  = (const float *) misc->data;
+    float       * y_d     = (float *) dst->data;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const bool prefill = T >= M3_PREFILL_T && !m3_legacy_path();
+
+    // contiguous head ranges per thread
+    const int64_t per_th  = (H + nth - 1)/nth;
+    const int64_t h_begin = std::min<int64_t>(ith*per_th, H);
+    const int64_t h_end   = std::min<int64_t>(h_begin + per_th, H);
+    const int64_t my_U    = h_end - h_begin;
+
+    float * shared = (float *) params->wdata;                     // (n_tok, 2R D_qk + n_ang): [bcn | tanp]
+    const int64_t prep_stride = 2*R*D_qk + n_ang;
+    float * wbuf = shared + m3_shared_floats(dst) + ith*m3_thread_floats(dst, nth);
+    float * krt  = wbuf;                       // (TB, R, D_qk)
+    float * qrt  = krt + M3_TB*R*D_qk;         // (TB, R, D_qk)
+    float * vlt  = qrt + M3_TB*R*D_qk;         // (TB, R, D_v)
+    float * wlt  = vlt + M3_TB*R*D_v;          // (TB, R, D_v)
+    float * bcn  = wlt + M3_TB*R*D_v;          // (TB, 2R, D_qk)
+    float * tanp = bcn + M3_TB*2*R*D_qk;       // (TB, n_ang)
+    float * cs   = tanp + M3_TB*n_ang;
+    float * ss   = cs + n_ang;
+    float * ztmp = ss + n_ang;                 // (D_v)
+    float * Ubuf = ztmp + D_v;                 // (D_qk, D_v) d-major state, prefill path
+    float * obuf = Ubuf + D_qk*D_v;            // (R, D_v)
+    float * Gbuf = obuf + R*D_v;               // (R, R)
+    float * snap = Gbuf + R*R;                 // (n_seqs, my_U, per_unit), in-place mode
+
+    // head-independent per-token prep: tanh(ang_raw)*pi, rms-normed B/C * weight
+    auto prep_token = [&](int64_t tok, float * bc_out, float * tan_out) {
+        const float * pd = (const float *) ((const char *) pdyn->data + tok*pdyn->nb[1]);
+        for (int64_t i = 0; i < n_ang; ++i) {
+            tan_out[i] = tanhf(pd[2*R*D_qk + i])*3.14159265358979323846f; // pi as a literal (MSVC)
+        }
+        for (int64_t g = 0; g < 2*R; ++g) {
+            const float * src = pd + g*D_qk;
+            const float * w   = norms_d + (g < R ? 0 : D_qk);
+            float * out = bc_out + g*D_qk;
+            double sum = 0.0;
+            for (int64_t d = 0; d < D_qk; ++d) {
+                sum += (double) src[d]*(double) src[d];
+            }
+            const float sc = 1.0f/sqrtf((float) (sum/D_qk) + eps);
+            for (int64_t d = 0; d < D_qk; ++d) {
+                out[d] = (src[d]*sc)*w[d];
+            }
+        }
+    };
+
+    if (prefill) {
+        // every thread preps a slice of the tokens, then all wait
+        const int64_t t0 = n_tok*ith/nth, t1 = n_tok*(ith + 1)/nth;
+        for (int64_t tok = t0; tok < t1; ++tok) {
+            prep_token(tok, shared + tok*prep_stride, shared + tok*prep_stride + 2*R*D_qk);
+        }
+        ggml_barrier(params->threadpool);
+    }
+
+    if (my_U <= 0) {
+        return;
+    }
+
+    auto src_row = [&](int64_t seq) -> const float * {
+        if (inplace) {
+            return (const float *) ((const char *) states->data + (int64_t) ((const int32_t *) ids->data)[seq]*states->nb[1]);
+        }
+        return (const float *) ((const char *) states->data + seq*states->nb[1]);
+    };
+    auto dst_row = [&](int64_t seq) -> float * {
+        if (inplace) {
+            return (float *) ((char *) sdst->data + seq*sdst->nb[1]);
+        }
+        return y_d + D_v*H*n_tok + seq*n_embd_s;
+    };
+    auto copy_unit = [&](float * d, const float * s, int64_t h) { // packed row -> packed row, one head
+        memcpy(d + h*D_v*D_qk,      s + h*D_v*D_qk,      D_v*D_qk*sizeof(float));
+        memcpy(d + off_K + h*R*D_qk, s + off_K + h*R*D_qk, R*D_qk*sizeof(float));
+        memcpy(d + off_V + h*R*D_v,  s + off_V + h*R*D_v,  R*D_v*sizeof(float));
+        memcpy(d + off_A + h*n_ang,  s + off_A + h*n_ang,  n_ang*sizeof(float));
+    };
+
+    if (inplace) {
+        for (int64_t seq = 0; seq < n_seqs; ++seq) {
+            const float * s = src_row(seq);
+            if (s == dst_row(seq)) {
+                continue;
+            }
+            for (int64_t h = h_begin; h < h_end; ++h) {
+                float * sp = snap + (seq*my_U + (h - h_begin))*per_unit;
+                memcpy(sp,                               s + h*D_v*D_qk,       D_v*D_qk*sizeof(float));
+                memcpy(sp + D_v*D_qk,                    s + off_K + h*R*D_qk, R*D_qk*sizeof(float));
+                memcpy(sp + D_v*D_qk + R*D_qk,           s + off_V + h*R*D_v,  R*D_v*sizeof(float));
+                memcpy(sp + D_v*D_qk + R*D_qk + R*D_v,   s + off_A + h*n_ang,  n_ang*sizeof(float));
+            }
+        }
+    }
+
+    // per-(token, head) scalars from the static projection
+    auto tok_scalars = [&](int64_t tok, int64_t h, float & dt, float & alpha, float & trap) {
+        const float * ps = (const float *) ((const char *) pstat->data + tok*pstat->nb[1]) + h*(2*D_v + 3);
+        dt = m3_softplus(ps[2*D_v + 0] + misc_d[h]);
+        const float a = fminf(-m3_softplus(ps[2*D_v + 1]), -a_floor);
+        alpha = expf(a*dt);
+        trap  = 1.0f/(1.0f + expf(-ps[2*D_v + 2]));
+    };
+
+    // k/q (bias + rotary at the head's current angle state), v, w for one token
+    auto build_kqvw = [&](int64_t tok, int64_t h, const float * bc, const float * tanp_t, float dt,
+                          float * ang, float * k, float * q, float * v, float * w) {
+        const float * ps     = (const float *) ((const char *) pstat->data + tok*pstat->nb[1]) + h*(2*D_v + 3);
+        const float * bias_h = bias_d + h*2*R*D_qk;
+        const float * mx_h   = mxz_d + h*2*R*D_v;
+        const float * mz_h   = mx_h + R*D_v;
+        const float * mo_h   = mo_d + h*R*D_v;
+
+        for (int64_t i = 0; i < n_ang; ++i) {
+            const float x = ang[i] + tanp_t[i]*dt;
+            ang[i] = x - 6.28318530717958647692f*rintf(x*0.15915494309189533577f); // wrap to [-pi, pi]
+        }
+        m3_sincos_n(ang, ss, cs, n_ang);
+
+        {
+            int64_t j = 0;
+#if defined(M3_SIMD)
+            for (; j + GGML_F32_EPR <= R*D_qk; j += GGML_F32_EPR) {
+                GGML_F32_VEC_STORE(k + j, GGML_F32_VEC_ADD(GGML_F32_VEC_LOAD(bc + j), GGML_F32_VEC_LOAD(bias_h + j)));
+                GGML_F32_VEC_STORE(q + j, GGML_F32_VEC_ADD(GGML_F32_VEC_LOAD(bc + R*D_qk + j), GGML_F32_VEC_LOAD(bias_h + R*D_qk + j)));
+            }
+#endif
+            for (; j < R*D_qk; ++j) {
+                k[j] = bc[j] + bias_h[j];
+                q[j] = bc[R*D_qk + j] + bias_h[R*D_qk + j];
+            }
+        }
+        // rotary on the pairs (i, i + D_qk/2), i < D_qk/4
+        for (int64_t r = 0; r < R; ++r) {
+            float * kr = k + r*D_qk;
+            float * qr = q + r*D_qk;
+            int64_t i = 0;
+#if defined(__AVX512F__)
+            for (; i + 16 <= n_ang; i += 16) {
+                const __m512 c  = _mm512_loadu_ps(cs + i);
+                const __m512 sn = _mm512_loadu_ps(ss + i);
+                const __m512 q0 = _mm512_loadu_ps(qr + i), q2 = _mm512_loadu_ps(qr + i + half);
+                const __m512 k0 = _mm512_loadu_ps(kr + i), k2 = _mm512_loadu_ps(kr + i + half);
+                _mm512_storeu_ps(qr + i,        _mm512_fnmadd_ps(q2, sn, _mm512_mul_ps(q0, c)));
+                _mm512_storeu_ps(qr + i + half, _mm512_fmadd_ps (q0, sn, _mm512_mul_ps(q2, c)));
+                _mm512_storeu_ps(kr + i,        _mm512_fnmadd_ps(k2, sn, _mm512_mul_ps(k0, c)));
+                _mm512_storeu_ps(kr + i + half, _mm512_fmadd_ps (k0, sn, _mm512_mul_ps(k2, c)));
+            }
+#endif
+            for (; i < n_ang; ++i) {
+                const float c = cs[i], sn = ss[i];
+                const float q0 = qr[i], q2 = qr[i + half];
+                qr[i] = q0*c - q2*sn; qr[i + half] = q0*sn + q2*c;
+                const float k0 = kr[i], k2 = kr[i + half];
+                kr[i] = k0*c - k2*sn; kr[i + half] = k0*sn + k2*c;
+            }
+        }
+
+        // v = x*mimo_x, w = silu(z*mimo_z)*mimo_o
+        for (int64_t r = 0; r < R; ++r) {
+            int64_t p = 0;
+#if defined(M3_SIMD)
+            for (; p + GGML_F32_EPR <= D_v; p += GGML_F32_EPR) {
+                GGML_F32_VEC_STORE(v + r*D_v + p, GGML_F32_VEC_MUL(GGML_F32_VEC_LOAD(ps + D_v + p), GGML_F32_VEC_LOAD(mx_h + r*D_v + p)));
+                GGML_F32_VEC_STORE(ztmp + p,      GGML_F32_VEC_MUL(GGML_F32_VEC_LOAD(ps + p),       GGML_F32_VEC_LOAD(mz_h + r*D_v + p)));
+            }
+#endif
+            for (; p < D_v; ++p) {
+                v[r*D_v + p] = ps[D_v + p]*mx_h[r*D_v + p];
+                ztmp[p]      = ps[p]*mz_h[r*D_v + p];
+            }
+            ggml_vec_silu_f32((int) D_v, w + r*D_v, ztmp);
+            p = 0;
+#if defined(M3_SIMD)
+            for (; p + GGML_F32_EPR <= D_v; p += GGML_F32_EPR) {
+                GGML_F32_VEC_STORE(w + r*D_v + p, GGML_F32_VEC_MUL(GGML_F32_VEC_LOAD(w + r*D_v + p), GGML_F32_VEC_LOAD(mo_h + r*D_v + p)));
+            }
+#endif
+            for (; p < D_v; ++p) {
+                w[r*D_v + p] *= mo_h[r*D_v + p];
+            }
+        }
+    };
+
+    for (int64_t seq = 0; seq < n_seqs; ++seq) {
+        float * row = dst_row(seq);
+        const float * s = src_row(seq);
+        if (s != row) {
+            for (int64_t h = h_begin; h < h_end; ++h) {
+                if (inplace) {
+                    const float * sp = snap + (seq*my_U + (h - h_begin))*per_unit;
+                    memcpy(row + h*D_v*D_qk,       sp,                             D_v*D_qk*sizeof(float));
+                    memcpy(row + off_K + h*R*D_qk, sp + D_v*D_qk,                  R*D_qk*sizeof(float));
+                    memcpy(row + off_V + h*R*D_v,  sp + D_v*D_qk + R*D_qk,         R*D_v*sizeof(float));
+                    memcpy(row + off_A + h*n_ang,  sp + D_v*D_qk + R*D_qk + R*D_v, n_ang*sizeof(float));
+                } else {
+                    copy_unit(row, s, h);
+                }
+            }
+        }
+
+        if (prefill) {
+            const int64_t tok0 = seq*T, tok1 = (seq + 1)*T;
+            for (int64_t h = h_begin; h < h_end; ++h) {
+                float * st   = row + h*D_v*D_qk;
+                float * K_st = row + off_K + h*R*D_qk;
+                float * V_st = row + off_V + h*R*D_v;
+                float * ang  = row + off_A + h*n_ang;
+                const float D_h = misc_d[H + h];
+                float * k = krt, * q = qrt, * v = vlt, * w = wlt;
+
+                // U_0 = S_0^T + delta_0 kv_0^T, delta_0 = (1 - trap_1) dt_1
+                float dt_n, alpha_n, trap_n;
+                tok_scalars(tok0, h, dt_n, alpha_n, trap_n);
+                const float delta0 = (1.0f - trap_n)*dt_n;
+                for (int64_t p = 0; p < D_v; ++p) {
+                    const float * srow = st + p*D_qk;
+                    for (int64_t d = 0; d < D_qk; ++d) {
+                        float kv = 0.0f;
+                        for (int64_t r = 0; r < R; ++r) {
+                            kv += V_st[r*D_v + p]*K_st[r*D_qk + d];
+                        }
+                        Ubuf[d*D_v + p] = srow[d] + delta0*kv;
+                    }
+                }
+
+                for (int64_t tok = tok0; tok < tok1; ++tok) {
+                    const float dt = dt_n, alpha = alpha_n, trap = trap_n;
+                    float delta = 0.0f;
+                    if (tok + 1 < tok1) {
+                        tok_scalars(tok + 1, h, dt_n, alpha_n, trap_n);
+                        delta = (1.0f - trap_n)*dt_n;
+                    }
+                    // the static projection rows are H*(2 D_v + 3) floats apart per
+                    // token and the prep rows 2R D_qk + n_ang: pull the next ones in
+                    // while this token's sweep runs
+                    if (tok + 2 < tok1) {
+                        const char * pn = (const char *) pstat->data + (tok + 2)*pstat->nb[1] + h*(2*D_v + 3)*sizeof(float);
+                        for (size_t off = 0; off < (2*D_v + 3)*sizeof(float); off += 64) {
+                            OLALA_PREFETCH_L2(pn + off);
+                        }
+                    }
+                    if (tok + 1 < tok1) {
+                        const char * bn = (const char *) (shared + (tok + 1)*prep_stride);
+                        for (size_t off = 0; off < (2*R*D_qk + n_ang)*sizeof(float); off += 64) {
+                            OLALA_PREFETCH_L2(bn + off);
+                        }
+                    }
+                    const float gamma = trap*dt;
+
+                    const float * bc     = shared + tok*prep_stride;
+                    const float * tanp_t = bc + 2*R*D_qk;
+                    build_kqvw(tok, h, bc, tanp_t, dt, ang, k, q, v, w);
+
+                    m3_prefill_token_dispatch(Ubuf, k, q, v, obuf, alpha, gamma + delta, R, D_qk, D_v);
+
+                    // y = sum_r w_r * (o_r + D v_r - delta sum_r' v_r' (k_r' . q_r))
+                    float * yr = y_d + (tok*H + h)*D_v;
+                    m3_prefill_epilogue(yr, obuf, k, q, v, w, Gbuf, D_h, delta, R, D_qk, D_v);
+                }
+
+                // S_T = U_T (delta_T = 0), k/v of the last token
+                for (int64_t p = 0; p < D_v; ++p) {
+                    float * srow = st + p*D_qk;
+                    for (int64_t d = 0; d < D_qk; ++d) {
+                        srow[d] = Ubuf[d*D_v + p];
+                    }
+                }
+                memcpy(K_st, k, R*D_qk*sizeof(float));
+                memcpy(V_st, v, R*D_v*sizeof(float));
+            }
+            continue;
+        }
+
+        for (int64_t tg = seq*T; tg < (seq + 1)*T; tg += M3_TB) {
+            const int64_t TB = std::min<int64_t>(M3_TB, (seq + 1)*T - tg);
+
+            for (int64_t tt = 0; tt < TB; ++tt) {
+                prep_token(tg + tt, bcn + tt*2*R*D_qk, tanp + tt*n_ang);
+            }
+
+            for (int64_t h = h_begin; h < h_end; ++h) {
+                const float D_h = misc_d[H + h];
+                float * ang = row + off_A + h*n_ang;
+
+                float alpha[M3_TB], beta[M3_TB], gamma[M3_TB];
+                const float * kp[M3_TB], * qp[M3_TB], * vp[M3_TB], * wp[M3_TB];
+                float * yp[M3_TB];
+
+                for (int64_t tt = 0; tt < TB; ++tt) {
+                    const int64_t tok = tg + tt;
+                    float dt, trap;
+                    tok_scalars(tok, h, dt, alpha[tt], trap);
+                    beta[tt]  = (1.0f - trap)*dt*alpha[tt];
+                    gamma[tt] = trap*dt;
+
+                    float * k = krt + tt*R*D_qk;
+                    float * q = qrt + tt*R*D_qk;
+                    float * v = vlt + tt*R*D_v;
+                    float * w = wlt + tt*R*D_v;
+                    build_kqvw(tok, h, bcn + tt*2*R*D_qk, tanp + tt*n_ang, dt, ang, k, q, v, w);
+
+                    // y seeded with sum_r w*D*v
+                    float * yr = y_d + (tok*H + h)*D_v;
+                    for (int64_t p = 0; p < D_v; ++p) {
+                        yr[p] = 0.0f;
+                    }
+                    for (int64_t r = 0; r < R; ++r) {
+                        for (int64_t p = 0; p < D_v; ++p) {
+                            yr[p] += D_h*w[r*D_v + p]*v[r*D_v + p];
+                        }
+                    }
+
+                    kp[tt] = k; qp[tt] = q; vp[tt] = v; wp[tt] = w; yp[tt] = yr;
+                }
+
+                float * st   = row + h*D_v*D_qk;
+                float * K_st = row + off_K + h*R*D_qk;
+                float * V_st = row + off_V + h*R*D_v;
+                m3_step_dispatch(st, K_st, V_st, kp, qp, vp, wp, yp, alpha, beta, gamma, R, TB, D_qk, D_v);
+                memcpy(K_st, kp[TB - 1], R*D_qk*sizeof(float));
+                memcpy(V_st, vp[TB - 1], R*D_v*sizeof(float));
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_mamba3_mimo(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_mamba3_mimo_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
+// ggml_compute_forward_geodesic
+
+static void ggml_compute_forward_geodesic_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * x = dst->src[0];
+    const ggml_tensor * g = dst->src[1];
+
+    const float scale     = *(const float *) dst->src[2]->data;
+    const float bias      = *(const float *) dst->src[3]->data;
+    const float inv_depth = ggml_get_op_params_f32(dst, 0);
+    const float pi4       = 0.785398163f;
+
+    const int64_t n  = x->ne[0];
+    const int64_t nr = ggml_nrows(x);
+
+    for (int64_t ir = params->ith; ir < nr; ir += params->nth) {
+        const int64_t i1 = ir % x->ne[1];
+        const int64_t i2 = (ir / x->ne[1]) % x->ne[2];
+        const int64_t i3 = ir / (x->ne[1]*x->ne[2]);
+        const float * xr = (const float *) ((const char *) x->data   + i1*x->nb[1]   + i2*x->nb[2]   + i3*x->nb[3]);
+        const float * gr = (const float *) ((const char *) g->data   + i1*g->nb[1]   + i2*g->nb[2]   + i3*g->nb[3]);
+        float       * yr = (float       *) ((char       *) dst->data + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3]);
+
+        ggml_float xx = 0.0, xg = 0.0, gg = 0.0;
+        for (int64_t i = 0; i < n; ++i) {
+            xx += (ggml_float) xr[i]*xr[i];
+            xg += (ggml_float) xr[i]*gr[i];
+            gg += (ggml_float) gr[i]*gr[i];
+        }
+        const float x_norm_sq = fmaxf((float) xx, 1e-12f);
+        const float coef      = (float) xg/x_norm_sq;
+        // |g - coef*x|^2 = |g|^2 - 2 coef x.g + coef^2 |x|^2, cancellation-prone, so
+        // accumulate it directly
+        ggml_float pp = 0.0;
+        for (int64_t i = 0; i < n; ++i) {
+            const float gp = gr[i] - coef*xr[i];
+            pp += (ggml_float) gp*gp;
+        }
+        GGML_UNUSED(gg);
+        const float tan_norm = fmaxf(sqrtf((float) pp), 1e-8f);
+        const float xn       = sqrtf(x_norm_sq);
+        float theta = fminf(tan_norm/fmaxf(xn, 1e-6f), pi4);
+        theta = fminf((theta*scale + bias)*inv_depth, pi4);
+        const float c  = cosf(theta);
+        const float s  = sinf(theta)*xn/tan_norm;
+        for (int64_t i = 0; i < n; ++i) {
+            yr[i] = xr[i]*c + (gr[i] - coef*xr[i])*s;
+        }
+    }
+}
+
+void ggml_compute_forward_geodesic(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_geodesic_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
+
+// ggml_compute_forward_olala_moe
+//
+// Fused Olala latent-MoE block for small token counts (decode). Four stages
+// separated by three barriers instead of ~14 graph nodes:
+//   A: lat = W_ld x, logits = W_r x, ush = W_us x          (rows split over threads)
+//   B: sel/weights (every thread, redundant); up = W_up[sel] lat; dsh = W_ds relu2(ush)
+//   C: down = W_down[sel] relu2(up)
+//   D: routed = sum_k w_k down_k; out = W_lu routed + dsh
+// Every thread quantizes the f32 operands it needs into its own scratch (no
+// extra barrier); the f32 matmul outputs live in a shared region of the work
+// buffer. The per-row vec_dot is the same one ggml's mul_mat uses, so the
+// numerics match the unfused graph. The (token, expert) pairs are processed
+// grouped by expert so a slab is reused from cache across the tokens routed to it.
+//
+// Low-memory mode (op_params[2] = expert cache budget in MiB, >= 0): the expert
+// tensors are a file mapping read on demand (llama --lazy-mode on). Right after
+// routing every thread asks the kernel to read the expert rows it will compute
+// (MADV_WILLNEED: large parallel reads; the lazy ranges are MADV_RANDOM so plain
+// faults would read 4 KiB at a time), then maps them in one call before use
+// (Linux MADV_POPULATE_READ instead of one fault per page). After the last stage
+// that reads them, the slabs are unmapped from the process except the most
+// recently used ones that fit in the budget (see olala-pager.cpp for what
+// happens to the page cache; Windows: PrefetchVirtualMemory + VirtualUnlock).
+// Only non-destructive calls are used.
+
+struct olala_moe_dims {
+    int64_t n_embd, n_tok, n_lat, n_expert, n_ff, n_ff_sh, k;
+};
+
+static olala_moe_dims olala_moe_get_dims(const ggml_tensor * op) {
+    olala_moe_dims d;
+    d.n_embd   = op->src[0]->ne[0];
+    d.n_tok    = op->src[0]->ne[1];
+    d.n_lat    = op->src[1]->ne[1];
+    d.n_expert = op->src[2]->ne[1];
+    d.n_ff     = op->src[4]->ne[1];
+    d.n_ff_sh  = op->src[7]->ne[1];
+    d.k        = ggml_get_op_params_i32(op, 0);
+    return d;
+}
+
+// padded size of one quantized activation row for weights of type wtype
+static inline size_t olala_moe_qrow(enum ggml_type wtype, int64_t n) {
+    const enum ggml_type vdt = ggml_get_type_traits_cpu(wtype)->vec_dot_type;
+    return GGML_PAD(ggml_row_size(vdt, n), 64);
+}
+
+struct olala_moe_ws {
+    // shared (bytes from the start of the work buffer)
+    size_t lat, logits, ush, up, dsh, down, ev_ptr, ev_size, ev_n, s_ptr, s_size, s_copy, c_slab, c_rd, c_n, shared;
+    // per-thread (bytes from the start of the thread's scratch)
+    size_t xq_ld, xq_r, xq_sh, latq, upq, ushq, routedq, routed, tmp, sel, wsel, scores, taken, order, cnt, per_thread;
+};
+
+static olala_moe_ws olala_moe_layout(const ggml_tensor * op) {
+    const olala_moe_dims d = olala_moe_get_dims(op);
+    const int64_t T = d.n_tok, k = d.k;
+    olala_moe_ws w;
+    size_t off = 0;
+    auto take = [&](size_t bytes) { const size_t o = off; off += GGML_PAD(bytes, 64); return o; };
+    w.lat    = take(T*d.n_lat*sizeof(float));
+    w.logits = take(T*d.n_expert*sizeof(float));
+    w.ush    = take(T*d.n_ff_sh*sizeof(float));
+    w.up     = take(T*k*d.n_ff*sizeof(float));
+    w.dsh    = take(T*d.n_embd*sizeof(float)); // shared-expert down output (was n_ff_sh: overflowed into `down` when n_ff_sh < n_embd)
+    w.down   = take(T*k*d.n_lat*sizeof(float));
+    w.ev_ptr  = take(4*d.n_expert*sizeof(const char *));
+    w.ev_size = take(4*d.n_expert*sizeof(size_t));
+    w.ev_n    = take(sizeof(int32_t));
+    w.s_ptr   = take(2*d.n_expert*sizeof(const char *));          // up/down slabs of the selected experts
+    w.s_size  = take(2*d.n_expert*sizeof(size_t));
+    w.s_copy  = take(2*d.n_expert*sizeof(const char *));          // expert cache: their copies
+    w.c_slab  = take(2*d.n_expert*sizeof(const char *));          // expert cache: copy of each up/down slab
+    w.c_rd    = take(2*d.n_expert*sizeof(olala_pager_read));     // expert cache: reads to do
+    w.c_n     = take(sizeof(int32_t));                            // number of reads, -1 = cache not usable
+    w.shared = off;
+    off = 0;
+    w.xq_ld   = take(T*olala_moe_qrow(op->src[1]->type, d.n_embd));
+    w.xq_r    = take(T*olala_moe_qrow(op->src[2]->type, d.n_embd));
+    w.xq_sh   = take(T*olala_moe_qrow(op->src[7]->type, d.n_embd));
+    w.latq    = take(T*olala_moe_qrow(op->src[4]->type, d.n_lat));
+    w.upq     = take(T*k*olala_moe_qrow(op->src[5]->type, d.n_ff));
+    w.ushq    = take(T*olala_moe_qrow(op->src[8]->type, d.n_ff_sh));
+    w.routedq = take(T*olala_moe_qrow(op->src[6]->type, d.n_lat));
+    w.routed  = take(T*d.n_lat*sizeof(float));
+    w.tmp     = take(std::max({d.n_ff, d.n_ff_sh, d.n_lat})*sizeof(float));
+    w.sel     = take(T*k*sizeof(int32_t));
+    w.wsel    = take(T*k*sizeof(float));
+    w.scores  = take(d.n_expert*sizeof(float));
+    w.taken   = take(d.n_expert);
+    w.order   = take(T*k*sizeof(int32_t));
+    w.cnt     = take((d.n_expert + 1)*sizeof(int32_t));
+    w.per_thread = off;
+    return w;
+}
+
+size_t ggml_olala_moe_work_size(const ggml_tensor * op, int n_threads) {
+    const olala_moe_ws w = olala_moe_layout(op);
+    return w.shared + (size_t) n_threads*w.per_thread + 64;
+}
+
+static void olala_moe_quantize(enum ggml_type wtype, const float * src, void * dst, int64_t n) {
+    const enum ggml_type vdt = ggml_get_type_traits_cpu(wtype)->vec_dot_type;
+    if (vdt == GGML_TYPE_F32) {
+        memcpy(dst, src, n*sizeof(float));
+        return;
+    }
+    ggml_from_float_t from_float = ggml_get_type_traits_cpu(vdt)->from_float;
+    GGML_ASSERT(from_float != nullptr);
+    from_float(src, dst, n);
+}
+
+// the Olala activations can leave the range of the f16 values of the dot operands (Q8_0 block scale: block
+// max > ~8e6 -> inf; F16: > 65504): a row whose max exceeds the limit of the vec_dot type of wtype is divided by a
+// power of two before the conversion (exact), the dot products are multiplied back by the returned factor (1 for the
+// usual rows). F32/BF16 operands need no guard.
+static inline float olala_moe_row_mul(enum ggml_type wtype, const float * src, int64_t n) {
+    const enum ggml_type vdt = ggml_get_type_traits_cpu(wtype)->vec_dot_type;
+    if (vdt == GGML_TYPE_F32 || vdt == GGML_TYPE_BF16) {
+        return 1.0f;
+    }
+    const float lim = vdt == GGML_TYPE_F16 ? 32768.0f : 4194304.0f;
+    float amax = 0.0f;
+    for (int64_t i = 0; i < n; ++i) {
+        amax = fmaxf(amax, fabsf(src[i]));
+    }
+    if (!(amax > lim)) {
+        return 1.0f;
+    }
+    return exp2f(ceilf(log2f(amax/lim)));
+}
+
+// expert cache budget in bytes
+static inline size_t olala_moe_budget(int32_t mib) {
+    return (uint64_t) mib >= SIZE_MAX/(1024*1024) ? SIZE_MAX : (size_t) mib*1024*1024;
+}
+
+static inline void olala_moe_scale(float * x, int64_t n, float mul) {
+    if (mul != 1.0f) {
+        const float inv = 1.0f/mul;
+        for (int64_t i = 0; i < n; ++i) {
+            x[i] *= inv;
+        }
+    }
+}
+
+static inline void olala_moe_relu2(float * dst, const float * src, int64_t n) {
+    for (int64_t i = 0; i < n; ++i) {
+        const float r = src[i] > 0.0f ? src[i] : 0.0f;
+        dst[i] = r*r;
+    }
+}
+
+static inline float olala_moe_sigmoid(float x) {
+    return 1.0f/(1.0f + expf(-x));
+}
+
+// scores = sigmoid(logits) + bias; ids of the k largest (desc, ties -> lower
+// index, all-NaN -> in-bounds fallback), same as the graph path.
+static void olala_moe_select(const float * lt, const float * bd, int64_t n_expert, int64_t k,
+                              int32_t * ids, float * scores, uint8_t * taken) {
+    for (int64_t e = 0; e < n_expert; ++e) {
+        scores[e] = olala_moe_sigmoid(lt[e]) + bd[e];
+        taken[e]  = 0;
+    }
+    for (int64_t i = 0; i < k; ++i) {
+        int64_t best = -1;
+        float   bv   = -FLT_MAX;
+        for (int64_t e = 0; e < n_expert; ++e) {
+            if (!taken[e] && scores[e] > bv) {
+                bv = scores[e];
+                best = e;
+            }
+        }
+        if (best < 0) {
+            best = i;
+        }
+        taken[best] = 1;
+        ids[i] = (int32_t) best;
+    }
+}
+
+// out[t*out_stride + r] = W[r] . xq[t], r in [r0, r1)
+static void olala_moe_gemv(const ggml_tensor * W, const char * wbase, int64_t K, int64_t r0, int64_t r1,
+                            const char * xq, size_t xq_stride, int64_t T, float * out, int64_t out_stride) {
+    ggml_vec_dot_t const vec_dot = ggml_get_type_traits_cpu(W->type)->vec_dot;
+    const size_t nb1 = W->nb[1];
+    for (int64_t r = r0; r < r1; ++r) {
+        const char * wrow = wbase + r*nb1;
+        for (int64_t t = 0; t < T; ++t) {
+            vec_dot((int) K, out + t*out_stride + r, 0, wrow, 0, xq + t*xq_stride, 0, 1);
+        }
+    }
+}
+
+static inline void olala_moe_split(int64_t n, int ith, int nth, int64_t * a, int64_t * b) {
+    *a = n*ith/nth;
+    *b = n*(ith + 1)/nth;
+}
+
+// ---- low-memory mode helpers (paging calls in olala-pager.cpp)
+
+// populate the rows [r0, r1) of expert e of W unless the previous call of this
+// thread already covered them
+struct olala_moe_populated {
+    int64_t e = -1, r0 = 0, r1 = 0;
+
+    void rows(const ggml_tensor * W, int64_t e_, int64_t r0_, int64_t r1_) {
+        if (e_ == e && r0_ >= r0 && r1_ <= r1) {
+            return;
+        }
+        olala_pager_populate((const char *) W->data + (size_t) e_*W->nb[2] + (size_t) r0_*W->nb[1], (size_t) (r1_ - r0_)*W->nb[1]);
+        e = e_; r0 = r0_; r1 = r1_;
+    }
+};
+
+// the up and down slabs of the experts flagged in used[] (expert order, so the
+// reads are in file order)
+static int olala_moe_slabs(const ggml_tensor * W_up, const ggml_tensor * W_down, const uint8_t * used,
+                            int64_t n_expert, const char ** ptrs, size_t * sizes) {
+    int n = 0;
+    for (const ggml_tensor * W : { W_up, W_down }) {
+        for (int64_t e = 0; e < n_expert; ++e) {
+            if (used[e]) {
+                ptrs[n]  = (const char *) W->data + (size_t) e*W->nb[2];
+                sizes[n] = W->nb[2];
+                ++n;
+            }
+        }
+    }
+    return n;
+}
+
+static void ggml_compute_forward_olala_moe_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * x      = dst->src[0];
+    const ggml_tensor * W_ld   = dst->src[1];
+    const ggml_tensor * W_r    = dst->src[2];
+    const ggml_tensor * r_bias = dst->src[3];
+    const ggml_tensor * W_up   = dst->src[4];
+    const ggml_tensor * W_down = dst->src[5];
+    const ggml_tensor * W_lu   = dst->src[6];
+    const ggml_tensor * W_us   = dst->src[7];
+    const ggml_tensor * W_ds   = dst->src[8];
+
+    const olala_moe_dims d = olala_moe_get_dims(dst);
+    const int64_t T = d.n_tok, k = d.k;
+    float w_scale;
+    memcpy(&w_scale, (const int32_t *) dst->op_params + 1, sizeof(float));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const olala_moe_ws ws = olala_moe_layout(dst);
+    GGML_ASSERT(params->wsize >= ws.shared + (size_t) nth*ws.per_thread);
+    char * shared = (char *) params->wdata;
+    char * mine   = shared + ws.shared + (size_t) ith*ws.per_thread;
+
+    float * lat    = (float *) (shared + ws.lat);
+    float * logits = (float *) (shared + ws.logits);
+    float * ush    = (float *) (shared + ws.ush);
+    float * up     = (float *) (shared + ws.up);
+    float * dsh    = (float *) (shared + ws.dsh);
+    float * down   = (float *) (shared + ws.down);
+
+    char    * xq_ld   = mine + ws.xq_ld;
+    char    * xq_r    = mine + ws.xq_r;
+    char    * xq_sh   = mine + ws.xq_sh;
+    char    * latq    = mine + ws.latq;
+    char    * upq     = mine + ws.upq;
+    char    * ushq    = mine + ws.ushq;
+    char    * routedq = mine + ws.routedq;
+    float   * routed  = (float *)   (mine + ws.routed);
+    float   * tmp     = (float *)   (mine + ws.tmp);
+    int32_t * sel     = (int32_t *) (mine + ws.sel);
+    float   * wsel    = (float *)   (mine + ws.wsel);
+    float   * scores  = (float *)   (mine + ws.scores);
+    uint8_t * taken   = (uint8_t *) (mine + ws.taken);
+    int32_t * order   = (int32_t *) (mine + ws.order);
+    int32_t * cnt     = (int32_t *) (mine + ws.cnt);
+
+    // low-memory mode: >= 0 = expert weights paged from disk, budget in MiB
+    const int32_t cache_mib = ggml_get_op_params_i32(dst, 2);
+    // the experts are read from the explicit cache (c_slab) this call
+    bool cached = false;
+    const char * const * c_slab = (const char * const *) (shared + ws.c_slab);
+
+    const size_t qs_ld = olala_moe_qrow(W_ld->type,   d.n_embd);
+    const size_t qs_r  = olala_moe_qrow(W_r->type,    d.n_embd);
+    const size_t qs_sh = olala_moe_qrow(W_us->type,   d.n_embd);
+    const size_t qs_up = olala_moe_qrow(W_up->type,   d.n_lat);
+    const size_t qs_dn = olala_moe_qrow(W_down->type, d.n_ff);
+    const size_t qs_ds = olala_moe_qrow(W_ds->type,   d.n_ff_sh);
+    const size_t qs_lu = olala_moe_qrow(W_lu->type,   d.n_lat);
+
+    const float * xd = (const float *) x->data;
+    const float * bd = (const float *) r_bias->data;
+
+    int64_t a, b;
+
+    // ---- stage A: lat, logits, ush from x
+    {
+        const enum ggml_type vdt_ld = ggml_get_type_traits_cpu(W_ld->type)->vec_dot_type;
+        const enum ggml_type vdt_r  = ggml_get_type_traits_cpu(W_r->type)->vec_dot_type;
+        const enum ggml_type vdt_sh = ggml_get_type_traits_cpu(W_us->type)->vec_dot_type;
+        for (int64_t t = 0; t < T; ++t) {
+            olala_moe_quantize(W_ld->type, xd + t*d.n_embd, xq_ld + t*qs_ld, d.n_embd);
+        }
+        const char * xq_r_use = xq_ld;
+        size_t qs_r_use = qs_ld;
+        if (vdt_r != vdt_ld) {
+            for (int64_t t = 0; t < T; ++t) {
+                olala_moe_quantize(W_r->type, xd + t*d.n_embd, xq_r + t*qs_r, d.n_embd);
+            }
+            xq_r_use = xq_r;
+            qs_r_use = qs_r;
+        }
+        const char * xq_sh_use = xq_ld;
+        size_t qs_sh_use = qs_ld;
+        if (vdt_sh != vdt_ld) {
+            if (vdt_sh == vdt_r) {
+                xq_sh_use = xq_r_use;
+                qs_sh_use = qs_r_use;
+            } else {
+                for (int64_t t = 0; t < T; ++t) {
+                    olala_moe_quantize(W_us->type, xd + t*d.n_embd, xq_sh + t*qs_sh, d.n_embd);
+                }
+                xq_sh_use = xq_sh;
+                qs_sh_use = qs_sh;
+            }
+        }
+
+        olala_moe_split(d.n_lat, ith, nth, &a, &b);
+        olala_moe_gemv(W_ld, (const char *) W_ld->data, d.n_embd, a, b, xq_ld, qs_ld, T, lat, d.n_lat);
+        olala_moe_split(d.n_expert, ith, nth, &a, &b);
+        olala_moe_gemv(W_r, (const char *) W_r->data, d.n_embd, a, b, xq_r_use, qs_r_use, T, logits, d.n_expert);
+        olala_moe_split(d.n_ff_sh, ith, nth, &a, &b);
+        olala_moe_gemv(W_us, (const char *) W_us->data, d.n_embd, a, b, xq_sh_use, qs_sh_use, T, ush, d.n_ff_sh);
+    }
+    ggml_barrier(params->threadpool);
+
+    // ---- stage B: selection + weights (redundant per thread), shared down, expert up
+    {
+        for (int64_t t = 0; t < T; ++t) {
+            const float * lt = logits + t*d.n_expert;
+            int32_t * st = sel  + t*k;
+            float   * wt = wsel + t*k;
+            olala_moe_select(lt, bd, d.n_expert, k, st, scores, taken);
+            float sum = 0.0f;
+            for (int64_t i = 0; i < k; ++i) {
+                wt[i] = olala_moe_sigmoid(lt[st[i]]);
+                sum += wt[i];
+            }
+            if (sum < 6.103515625e-5f) {
+                sum = 6.103515625e-5f;
+            }
+            for (int64_t i = 0; i < k; ++i) {
+                wt[i] = (wt[i]/sum)*w_scale;
+            }
+        }
+
+        // (token, expert) pairs grouped by expert (counting sort, stable), so the
+        // tokens routed to one expert reuse its slab while it is in cache
+        for (int64_t e = 0; e <= d.n_expert; ++e) {
+            cnt[e] = 0;
+        }
+        for (int64_t p = 0; p < T*k; ++p) {
+            GGML_ASSERT(sel[p] >= 0 && sel[p] < d.n_expert);
+            cnt[sel[p] + 1]++;
+        }
+        for (int64_t e = 0; e < d.n_expert; ++e) {
+            cnt[e + 1] += cnt[e];
+        }
+        for (int64_t p = 0; p < T*k; ++p) {
+            order[cnt[sel[p]]++] = (int32_t) p;
+        }
+
+        // low-memory mode, explicit expert cache: thread 0 resolves the selected
+        // slabs to their copies in the cache (pinned until the end of stage C),
+        // then every thread reads a share of the misses (in 128 KiB pieces, so
+        // the SSD sees many requests at once)
+        if (cache_mib >= 0 && olala_pager_cache_enabled()) {
+            const char ** c_slab_w = (const char **) (shared + ws.c_slab);
+            olala_pager_read * c_rd = (olala_pager_read *) (shared + ws.c_rd);
+            int32_t * c_n = (int32_t *) (shared + ws.c_n);
+            if (ith == 0) {
+                for (int64_t e = 0; e < d.n_expert; ++e) {
+                    taken[e] = 0;
+                }
+                for (int64_t p = 0; p < T*k; ++p) {
+                    taken[sel[p]] = 1;
+                }
+                const char ** ptrs   = (const char **) (shared + ws.s_ptr);
+                size_t      * sizes  = (size_t *)      (shared + ws.s_size);
+                const char ** copies = (const char **) (shared + ws.s_copy);
+                const int n = olala_moe_slabs(W_up, W_down, taken, d.n_expert, ptrs, sizes);
+                int n_rd = 0;
+                if (olala_pager_cache_get(ptrs, sizes, n, olala_moe_budget(cache_mib), copies, c_rd, &n_rd)) {
+                    // slabs are listed up then down, each in expert order
+                    int j = 0;
+                    for (int w = 0; w < 2; ++w) {
+                        for (int64_t e = 0; e < d.n_expert; ++e) {
+                            c_slab_w[w*d.n_expert + e] = taken[e] ? copies[j++] : nullptr;
+                        }
+                    }
+                    *c_n = n_rd;
+                } else {
+                    *c_n = -1;
+                }
+            }
+            ggml_barrier(params->threadpool);
+            if (*c_n >= 0) {
+                cached = true;
+                const size_t piece = 128*1024;
+                int64_t idx = 0;
+                for (int32_t j = 0; j < *c_n; ++j) {
+                    for (size_t o = 0; o < c_rd[j].n; o += piece, ++idx) {
+                        if (idx % nth == ith) {
+                            olala_pager_cache_read(c_rd[j], o, std::min(piece, c_rd[j].n - o));
+                        }
+                    }
+                }
+                // also the slabs another op (context) is reading
+                if (ith == 0) {
+                    olala_pager_cache_wait(c_slab, (int) (2*d.n_expert));
+                }
+                ggml_barrier(params->threadpool);
+            }
+        }
+
+        // low-memory mode, paging the mapping: every thread starts the reads of
+        // the expert rows it will compute (up now, down in stage C), so the
+        // requests go out in parallel and the shared expert below runs while
+        // they are in flight
+        if (cache_mib >= 0 && !cached) {
+            for (int w = 0; w < 2; ++w) {
+                const ggml_tensor * Wx = w == 0 ? W_up : W_down;
+                const int64_t n_r = w == 0 ? d.n_ff : d.n_lat;
+                int64_t a2, b2;
+                olala_moe_split(T*k*n_r, ith, nth, &a2, &b2);
+                int64_t le = -1, l0 = 0, l1 = 0;
+                for (int64_t i = a2; i < b2; ) {
+                    const int64_t pair = order[i/n_r];
+                    const int64_t r0   = i % n_r;
+                    const int64_t r1   = std::min<int64_t>(n_r, r0 + (b2 - i));
+                    const int64_t e    = sel[pair];
+                    if (!(e == le && r0 >= l0 && r1 <= l1)) {
+                        olala_pager_prefetch((const char *) Wx->data + (size_t) e*Wx->nb[2] + (size_t) r0*Wx->nb[1], (size_t) (r1 - r0)*Wx->nb[1]);
+                        le = e; l0 = r0; l1 = r1;
+                    }
+                    i += r1 - r0;
+                }
+            }
+        }
+
+        // shared expert down: relu2 of ush, then W_ds rows
+        olala_moe_split(d.n_embd, ith, nth, &a, &b);
+        if (a < b) {
+            bool scaled = false;
+            for (int64_t t = 0; t < T; ++t) {
+                olala_moe_relu2(tmp, ush + t*d.n_ff_sh, d.n_ff_sh);
+                const float mul = olala_moe_row_mul(W_ds->type, tmp, d.n_ff_sh);
+                scaled |= mul != 1.0f;
+                olala_moe_scale(tmp, d.n_ff_sh, mul);
+                olala_moe_quantize(W_ds->type, tmp, ushq + t*qs_ds, d.n_ff_sh);
+            }
+            olala_moe_gemv(W_ds, (const char *) W_ds->data, d.n_ff_sh, a, b, ushq, qs_ds, T, dsh, d.n_embd);
+            if (scaled) {
+                for (int64_t t = 0; t < T; ++t) {
+                    olala_moe_relu2(tmp, ush + t*d.n_ff_sh, d.n_ff_sh);
+                    const float mul = olala_moe_row_mul(W_ds->type, tmp, d.n_ff_sh);
+                    for (int64_t r = a; r < b && mul != 1.0f; ++r) {
+                        dsh[t*d.n_embd + r] *= mul;
+                    }
+                }
+            }
+        }
+
+        for (int64_t t = 0; t < T; ++t) {
+            olala_moe_quantize(W_up->type, lat + t*d.n_lat, latq + t*qs_up, d.n_lat);
+        }
+
+        // expert up rows, flattened over (pair in expert order, row)
+        {
+            ggml_vec_dot_t const vec_dot = ggml_get_type_traits_cpu(W_up->type)->vec_dot;
+            const int64_t n_rows = T*k*d.n_ff;
+            olala_moe_split(n_rows, ith, nth, &a, &b);
+            olala_moe_populated pop;
+            for (int64_t i = a; i < b; ) {
+                const int64_t pair = order[i/d.n_ff];
+                const int64_t t    = pair/k;
+                const int64_t r0   = i % d.n_ff;
+                const int64_t r1   = std::min<int64_t>(d.n_ff, r0 + (b - i));
+                const int32_t e    = sel[pair];
+                if (cache_mib >= 0 && !cached) {
+                    pop.rows(W_up, e, r0, r1);
+                }
+                const char * wbase = cached ? c_slab[e] : (const char *) W_up->data + (size_t) e*W_up->nb[2];
+                const char * xq    = latq + t*qs_up;
+                float * out = up + pair*d.n_ff;
+                for (int64_t r = r0; r < r1; ++r) {
+                    vec_dot((int) d.n_lat, out + r, 0, wbase + r*W_up->nb[1], 0, xq, 0, 1);
+                }
+                i += r1 - r0;
+            }
+        }
+    }
+    ggml_barrier(params->threadpool);
+
+    // ---- stage C: expert down rows, flattened over (pair in expert order, row)
+    {
+        ggml_vec_dot_t const vec_dot = ggml_get_type_traits_cpu(W_down->type)->vec_dot;
+        const int64_t n_rows = T*k*d.n_lat;
+        olala_moe_split(n_rows, ith, nth, &a, &b);
+        int64_t last_pair = -1;
+        float   mul_dn    = 1.0f;
+        olala_moe_populated pop;
+        for (int64_t i = a; i < b; ) {
+            const int64_t pair = order[i/d.n_lat];
+            const int64_t r0 = i % d.n_lat;
+            const int64_t r1 = std::min<int64_t>(d.n_lat, r0 + (b - i));
+            if (cache_mib >= 0 && !cached) {
+                pop.rows(W_down, sel[pair], r0, r1);
+            }
+            if (pair != last_pair) {
+                olala_moe_relu2(tmp, up + pair*d.n_ff, d.n_ff);
+                mul_dn = olala_moe_row_mul(W_down->type, tmp, d.n_ff);
+                olala_moe_scale(tmp, d.n_ff, mul_dn);
+                olala_moe_quantize(W_down->type, tmp, upq + pair*qs_dn, d.n_ff);
+                last_pair = pair;
+            }
+            const int32_t e = sel[pair];
+            const char * wbase = cached ? c_slab[d.n_expert + e] : (const char *) W_down->data + (size_t) e*W_down->nb[2];
+            const char * xq    = upq + pair*qs_dn;
+            float * out = down + pair*d.n_lat;
+            for (int64_t r = r0; r < r1; ++r) {
+                vec_dot((int) d.n_ff, out + r, 0, wbase + r*W_down->nb[1], 0, xq, 0, 1);
+                out[r] *= mul_dn;
+            }
+            i += r1 - r0;
+        }
+    }
+    ggml_barrier(params->threadpool);
+
+    // explicit expert cache: no thread reads the copies past this point
+    if (cached && ith == 0) {
+        olala_pager_cache_release(c_slab, (int) (2*d.n_expert));
+    }
+
+    // ---- stage D: weighted reduce (redundant per thread), latent up + shared
+    {
+        olala_moe_split(d.n_embd, ith, nth, &a, &b);
+        if (a < b) {
+            for (int64_t t = 0; t < T; ++t) {
+                const float * et = down + t*k*d.n_lat;
+                const float * wt = wsel + t*k;
+                float * ot = routed + t*d.n_lat;
+                for (int64_t i = 0; i < d.n_lat; ++i) {
+                    ot[i] = et[i]*wt[0];
+                }
+                for (int64_t kk = 1; kk < k; ++kk) {
+                    const float * ei = et + kk*d.n_lat;
+                    const float  wi = wt[kk];
+                    for (int64_t i = 0; i < d.n_lat; ++i) {
+                        ot[i] += ei[i]*wi;
+                    }
+                }
+                const float mul = olala_moe_row_mul(W_lu->type, ot, d.n_lat);
+                memcpy(tmp, ot, d.n_lat*sizeof(float));
+                olala_moe_scale(tmp, d.n_lat, mul);
+                olala_moe_quantize(W_lu->type, tmp, routedq + t*qs_lu, d.n_lat);
+            }
+            float * out = (float *) dst->data;
+            olala_moe_gemv(W_lu, (const char *) W_lu->data, d.n_lat, a, b, routedq, qs_lu, T, out, d.n_embd);
+            for (int64_t t = 0; t < T; ++t) {
+                const float mul = olala_moe_row_mul(W_lu->type, routed + t*d.n_lat, d.n_lat);
+                for (int64_t r = a; r < b; ++r) {
+                    out[t*d.n_embd + r] = out[t*d.n_embd + r]*mul + dsh[t*d.n_embd + r];
+                }
+            }
+        }
+    }
+
+    // low-memory mode: no thread reads the expert weights past the stage C
+    // barrier. Thread 0 updates the LRU of resident slabs (taken[] still holds
+    // the experts of this call, see stage B) and publishes the slabs to drop;
+    // all threads then release a share of them. (Explicit cache: released above.)
+    if (cache_mib >= 0 && !cached) {
+        const char ** ev_ptr  = (const char **) (shared + ws.ev_ptr);
+        size_t      * ev_size = (size_t *)      (shared + ws.ev_size);
+        int32_t     * ev_n    = (int32_t *)     (shared + ws.ev_n);
+        if (ith == 0) {
+            for (int64_t e = 0; e < d.n_expert; ++e) {
+                taken[e] = 0;
+            }
+            for (int64_t p = 0; p < T*k; ++p) {
+                taken[sel[p]] = 1;
+            }
+            const char ** ptrs  = (const char **) (shared + ws.s_ptr);
+            size_t      * sizes = (size_t *)      (shared + ws.s_size);
+            const int n = olala_moe_slabs(W_up, W_down, taken, d.n_expert, ptrs, sizes);
+            *ev_n = olala_pager_used(ptrs, sizes, n, olala_moe_budget(cache_mib),
+                                      ev_ptr, ev_size, (int) (4*d.n_expert));
+        }
+        ggml_barrier(params->threadpool);
+        for (int32_t j = ith; j < *ev_n; j += nth) {
+            olala_pager_release(ev_ptr[j], ev_size[j]);
+        }
+    }
+}
+
+void ggml_compute_forward_olala_moe(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_olala_moe_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // ggml_compute_forward_rwkv_wkv7
 
 static void ggml_compute_forward_rwkv_wkv7_f32(
@@ -12658,5 +14183,398 @@ void ggml_compute_forward_lightning_indexer(
                 dst_row[ik] = score + GGML_CPU_FP16_TO_FP32(m_row[ik]);
             }
         }
+    }
+}
+
+
+// ---- Olala V-layer helpers (reference implementations; the production CPU path keeps the author's graph) ----
+
+static inline void olala_row_to_f32(const ggml_tensor * W, int64_t r, float * dst) {
+    const char * p = (const char *) W->data + (size_t) r*W->nb[1];
+    if (W->type == GGML_TYPE_F32) {
+        memcpy(dst, p, (size_t) W->ne[0]*sizeof(float));
+        return;
+    }
+    ggml_to_float_t to_float = ggml_get_type_traits(W->type)->to_float;
+    GGML_ASSERT(to_float != nullptr);
+    to_float(p, dst, W->ne[0]);
+}
+
+// y = concat_i(W_i^T x): rows split across the threads
+void ggml_compute_forward_olala_mmv(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * x = dst->src[0];
+    const int64_t n = x->ne[0];
+    const int64_t T = x->ne[1];
+    const int64_t rows = dst->ne[0];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+    const int64_t r0 = rows*ith/nth;
+    const int64_t r1 = rows*(ith + 1)/nth;
+
+    // one dequantized row per thread (work size: ggml_graph_plan)
+    float * w = (float *) params->wdata + (n + CACHE_LINE_SIZE_F32)*ith;
+    const float * xd = (const float *) x->data;
+    float * y = (float *) dst->data;
+
+    int64_t base = 0;
+    for (int i = 1; i < GGML_MAX_SRC && dst->src[i] != nullptr; ++i) {
+        const ggml_tensor * W = dst->src[i];
+        const int64_t nr = W->ne[1];
+        const int64_t a = std::max<int64_t>(r0, base);
+        const int64_t b = std::min<int64_t>(r1, base + nr);
+        for (int64_t r = a; r < b; ++r) {
+            olala_row_to_f32(W, r - base, w);
+            for (int64_t t = 0; t < T; ++t) {
+                const float * xt = xd + t*n;
+                float s = 0.0f;
+                for (int64_t c = 0; c < n; ++c) {
+                    s += w[c]*xt[c];
+                }
+                y[t*rows + r] = s;
+            }
+        }
+        base += nr;
+    }
+}
+
+static inline float olala_sigmoid_f32(float x) { return 1.0f/(1.0f + expf(-x)); }
+
+// see ggml_olala_tpa_prep (ggml.h) for the layouts; the math follows build_olala_v_mixer (llama.cpp src/models/olala.cpp)
+void ggml_compute_forward_olala_tpa_prep(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * pr   = dst->src[0];
+    const ggml_tensor * prev = dst->src[1];
+    const ggml_tensor * pos  = dst->src[2];
+    const float * qn = (const float *) dst->src[3]->data;
+    const float * kn = (const float *) dst->src[4]->data;
+    const float * sc = (const float *) dst->src[5]->data;
+
+    const int H  = ggml_get_op_params_i32(dst, 0);
+    const int Hn = ggml_get_op_params_i32(dst, 1);
+    const int R  = ggml_get_op_params_i32(dst, 2);
+    const int Dh = ggml_get_op_params_i32(dst, 3);
+    const int Hs = ggml_get_op_params_i32(dst, 4);
+    const int n_seqs = ggml_get_op_params_i32(dst, 5);
+    const float eps    = ggml_get_op_params_f32(dst, 6);
+    const float wsize  = ggml_get_op_params_f32(dst, 7);
+    const float gate_b = ggml_get_op_params_f32(dst, 8);
+    const bool  factored = ggml_get_op_params_i32(dst, 9) != 0;
+
+    const int64_t T = pr->ne[1];
+    const int64_t n_seq_t = T/n_seqs;
+    const int64_t ROW = pr->ne[0];
+    const int64_t OAK = (int64_t) H*Dh, OAV = OAK + Hn*R, OBK = OAV + Hn*R, OBV = OBK + R*Dh, OSK = OBV + R*Dh, OSV = OSK + Hn, OLAM = OSV + Hn, OG = OLAM + Hn;
+    // per-token rows of the K / V outputs: expanded (Hn*Dh) or factored (ggml_olala_tpa_row_k / _v)
+    const int64_t KR = factored ? ggml_olala_tpa_row_k(Hn, R, Dh) : (int64_t) Hn*Dh;
+    const int64_t VR = factored ? ggml_olala_tpa_row_v(Hn, R, Dh) : (int64_t) Hn*Dh;
+    const int64_t o_k = T*H*Dh, o_v = o_k + T*KR, o_lam = o_v + T*VR, o_g = o_lam + T*Hn, o_last = o_g + (int64_t) T*Hs*Dh;
+
+    const float   * prd  = (const float *) pr->data;
+    const int32_t * posd = (const int32_t *) pos->data;
+    const float   * pvd  = (const float *) prev->data;
+    const int64_t   pv_s = prev->nb[1]/sizeof(float);
+    float * out = (float *) dst->data;
+
+    // raw TPA k/v of token t, kv head hn (1/R scale as the graph)
+    auto raw = [&](int64_t t, int hn, bool is_v, float * o) {
+        const float * p = prd + t*ROW;
+        const float * A = p + (is_v ? OAV : OAK) + hn*R;
+        const float * B = p + (is_v ? OBV : OBK);
+        for (int d = 0; d < Dh; ++d) {
+            float s = 0.0f;
+            for (int r = 0; r < R; ++r) {
+                s += B[r*Dh + d]*A[r];
+            }
+            o[d] = s*(1.0f/(float) R);
+        }
+    };
+
+    // 5 rows of Dh floats per thread (work size: ggml_graph_plan)
+    float * kr = (float *) params->wdata + (5*Dh + CACHE_LINE_SIZE_F32)*params->ith;
+    float * vr = kr + Dh;
+    float * kp = vr + Dh;
+    float * vp = kp + Dh;
+    float * kx = vp + Dh;
+
+    // (token, q head) pairs across the threads; the kv-head work is done by the pair whose head is the first of its group
+    const int64_t n_pairs = T*H;
+    for (int64_t pi = params->ith; pi < n_pairs; pi += params->nth) {
+        const int64_t t = pi/H;
+        const int     h = (int) (pi - t*H);
+        const int     G = H/Hn;
+        const int     hn = h/G;
+        const int64_t s  = t/n_seq_t;
+        const int64_t tt = t - s*n_seq_t;
+        const float * p  = prd + t*ROW;
+        float pmask = (float) posd[t];
+        pmask = pmask < 0.0f ? 0.0f : (pmask > 1.0f ? 1.0f : pmask);
+        const float lp = logf(std::min(std::max((float) posd[t] + 1.0f, 1.0f), wsize));
+
+        if (h % G == 0) {
+            raw(t, hn, false, kr);
+            raw(t, hn, true,  vr);
+            if (tt == 0) {
+                memcpy(kp, pvd + s*pv_s + hn*Dh,         Dh*sizeof(float));
+                memcpy(vp, pvd + s*pv_s + Hn*Dh + hn*Dh, Dh*sizeof(float));
+            } else {
+                raw(t - 1, hn, false, kp);
+                raw(t - 1, hn, true,  vp);
+            }
+            if (tt == n_seq_t - 1) {
+                memcpy(out + o_last + s*2*Hn*Dh + hn*Dh,         kr, Dh*sizeof(float));
+                memcpy(out + o_last + s*2*Hn*Dh + Hn*Dh + hn*Dh, vr, Dh*sizeof(float));
+            }
+            const float ak = olala_sigmoid_f32(p[OSK + hn])*pmask;
+            const float av = olala_sigmoid_f32(p[OSV + hn])*pmask;
+            const float bk = ak*-1.0f + 1.0f;
+            const float bv = av*-1.0f + 1.0f;
+            float ss = 0.0f;
+            for (int d = 0; d < Dh; ++d) {
+                kx[d] = kp[d]*ak + kr[d]*bk;
+                ss += kx[d]*kx[d];
+                if (!factored) {
+                    out[o_v + (t*Hn + hn)*Dh + d] = vp[d]*av + vr[d]*bv;
+                }
+            }
+            const float rs = 1.0f/sqrtf(ss/(float) Dh + eps);
+            if (factored) {
+                // the factors of this token (B rows written by the first kv head) and the per-head scalars
+                float * ko = out + o_k + t*KR;
+                float * vo = out + o_v + t*VR;
+                if (hn == 0) {
+                    memcpy(ko, p + OBK, (size_t) R*Dh*sizeof(float));
+                    memcpy(vo, p + OBV, (size_t) R*Dh*sizeof(float));
+                    for (int64_t i = (int64_t) R*Dh + Hn*R + 2*Hn; i < KR; ++i) {
+                        ko[i] = 0.0f;
+                    }
+                    for (int64_t i = (int64_t) R*Dh + Hn*R + Hn; i < VR; ++i) {
+                        vo[i] = 0.0f;
+                    }
+                }
+                memcpy(ko + R*Dh + hn*R, p + OAK + hn*R, R*sizeof(float));
+                memcpy(vo + R*Dh + hn*R, p + OAV + hn*R, R*sizeof(float));
+                ko[R*Dh + Hn*R + hn]      = rs/(float) R;
+                ko[R*Dh + Hn*R + Hn + hn] = ak;
+                vo[R*Dh + Hn*R + hn]      = av;
+            } else {
+                for (int d = 0; d < Dh; ++d) {
+                    out[o_k + (t*Hn + hn)*Dh + d] = (kx[d]*rs)*kn[d];
+                }
+            }
+        }
+        {
+            const float * q = p + h*Dh;
+            float ss = 0.0f;
+            for (int d = 0; d < Dh; ++d) {
+                ss += q[d]*q[d];
+            }
+            const float rs = 1.0f/sqrtf(ss/(float) Dh + eps);
+            for (int d = 0; d < Dh; ++d) {
+                // factored: the k_norm weight moves from K to q (q.(w*k) = (q*w).k)
+                out[(t*H + h)*Dh + d] = (((q[d]*rs)*qn[d])*lp)*sc[h]*(factored ? kn[d] : 1.0f);
+            }
+        }
+        if (h == 0) {
+            for (int i = 0; i < Hn; ++i) {
+                out[o_lam + t*Hn + i] = olala_sigmoid_f32(p[OLAM + i]);
+            }
+            for (int64_t i = 0; i < (int64_t) Hs*Dh; ++i) {
+                const float g = p[OG + i] + gate_b;
+                out[o_g + t*Hs*Dh + i] = g/(1.0f + expf(-g));
+            }
+        }
+    }
+}
+
+// see ggml_olala_tpa_attn (ggml.h): reference implementation, one (stream, token, head) row at a time
+void ggml_compute_forward_olala_tpa_attn(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * q    = dst->src[0];
+    const ggml_tensor * k    = dst->src[1];
+    const ggml_tensor * v    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    const ggml_tensor * prev = dst->src[4];
+
+    const int   Hn      = ggml_get_op_params_i32(dst, 0);
+    const int   R       = ggml_get_op_params_i32(dst, 1);
+    const float scale   = ggml_get_op_params_f32(dst, 2);
+    const float softcap = ggml_get_op_params_f32(dst, 3);
+
+    const int64_t Dh   = q->ne[0];
+    const int64_t H    = q->ne[1];
+    const int64_t T    = q->ne[2];
+    const int64_t ns   = q->ne[3];
+    const int64_t n_kv = k->ne[1];
+    const int64_t G    = H/Hn;
+
+    const bool kf16 = k->type == GGML_TYPE_F16;
+    auto ld = [&](const ggml_tensor * x, int64_t c, int64_t s, int64_t i) -> float {
+        const char * row = (const char *) x->data + c*x->nb[1] + s*x->nb[2];
+        return kf16 ? GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) row)[i]) : ((const float *) row)[i];
+    };
+    auto mk = [&](int64_t c, int64_t t, int64_t s) -> float {
+        const char * row = (const char *) mask->data + t*mask->nb[1] + s*mask->nb[3];
+        return mask->type == GGML_TYPE_F16 ? GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) row)[c]) : ((const float *) row)[c];
+    };
+
+    const int64_t oA = (int64_t) R*Dh, oS = oA + (int64_t) Hn*R; // offsets in a row: A, then the scalars
+
+    float * P  = (float *) params->wdata + ((R + 1)*n_kv + Dh + CACHE_LINE_SIZE_F32)*params->ith; // (n_kv, R): q.B_k
+    float * sc = P + R*n_kv;                                                                       // (n_kv) scores
+    float * o  = sc + n_kv;                                                                        // (Dh)
+
+    const int64_t n_rows = ns*T*H;
+    for (int64_t ir = params->ith; ir < n_rows; ir += params->nth) {
+        const int64_t s = ir/(T*H);
+        const int64_t t = (ir - s*T*H)/H;
+        const int64_t h = ir - s*T*H - t*H;
+        const int64_t g = h/G;
+        const float * qr = (const float *) ((const char *) q->data + h*q->nb[1] + t*q->nb[2] + s*q->nb[3]);
+        const int32_t * pv = (const int32_t *) ((const char *) prev->data + s*prev->nb[1]);
+
+        for (int64_t c = 0; c < n_kv; ++c) {
+            for (int r = 0; r < R; ++r) {
+                float acc = 0.0f;
+                for (int64_t d = 0; d < Dh; ++d) {
+                    acc += qr[d]*ld(k, c, s, r*Dh + d);
+                }
+                P[c*R + r] = acc;
+            }
+        }
+        float mx = -INFINITY;
+        for (int64_t c = 0; c < n_kv; ++c) {
+            const float m = mk(c, t, s);
+            if (m == -INFINITY) {
+                sc[c] = -INFINITY;
+                continue;
+            }
+            const int64_t p = pv[c];
+            const float ak = ld(k, c, s, oS + Hn + g);
+            float cur = 0.0f, prv = 0.0f;
+            for (int r = 0; r < R; ++r) {
+                cur += ld(k, c, s, oA + g*R + r)*P[c*R + r];
+                if (p >= 0) {
+                    prv += ld(k, p, s, oA + g*R + r)*P[p*R + r];
+                }
+            }
+            float x = scale*ld(k, c, s, oS + g)*((1.0f - ak)*cur + ak*prv);
+            if (softcap != 0.0f) {
+                x = softcap*tanhf(x/softcap);
+            }
+            sc[c] = x + m;
+            mx = std::max(mx, sc[c]);
+        }
+        for (int64_t d = 0; d < Dh; ++d) {
+            o[d] = 0.0f;
+        }
+        float sum = 0.0f;
+        if (mx != -INFINITY) {
+            for (int64_t c = 0; c < n_kv; ++c) {
+                if (sc[c] == -INFINITY) {
+                    continue;
+                }
+                const float w = expf(sc[c] - mx);
+                sum += w;
+                const int64_t p = pv[c];
+                const float av = ld(v, c, s, oS + g);
+                for (int r = 0; r < R; ++r) {
+                    const float wc = w*(1.0f - av)*ld(v, c, s, oA + g*R + r);
+                    const float wp = p >= 0 ? w*av*ld(v, p, s, oA + g*R + r) : 0.0f;
+                    for (int64_t d = 0; d < Dh; ++d) {
+                        o[d] += wc*ld(v, c, s, r*Dh + d) + (p >= 0 ? wp*ld(v, p, s, r*Dh + d) : 0.0f);
+                    }
+                }
+            }
+        }
+        float * y = (float *) ((char *) dst->data + h*dst->nb[1] + t*dst->nb[2] + s*dst->nb[3]);
+        const float norm = sum > 0.0f ? 1.0f/(sum*(float) R) : 0.0f;
+        for (int64_t d = 0; d < Dh; ++d) {
+            y[d] = o[d]*norm;
+        }
+    }
+}
+
+// see ggml_olala_tpa_expand (ggml.h); one (stream, cell) row at a time
+void ggml_compute_forward_olala_tpa_expand(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * rows = dst->src[0];
+    const ggml_tensor * prev = dst->src[1];
+
+    const int  Hn   = ggml_get_op_params_i32(dst, 0);
+    const int  R    = ggml_get_op_params_i32(dst, 1);
+    const bool is_v = ggml_get_op_params_i32(dst, 2) != 0;
+
+    const int64_t Dh   = dst->ne[0];
+    const int64_t n_kv = dst->ne[2];
+    const int64_t ns   = dst->ne[3];
+    const int64_t oA   = (int64_t) R*Dh, oS = oA + (int64_t) Hn*R;
+
+    const bool f16 = rows->type == GGML_TYPE_F16;
+    auto ld = [&](int64_t c, int64_t s, int64_t i) -> float {
+        const char * row = (const char *) rows->data + c*rows->nb[1] + s*rows->nb[2];
+        return f16 ? GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) row)[i]) : ((const float *) row)[i];
+    };
+
+    for (int64_t ir = params->ith; ir < ns*n_kv; ir += params->nth) {
+        const int64_t s = ir/n_kv;
+        const int64_t c = ir - s*n_kv;
+        const int32_t p = ((const int32_t *) ((const char *) prev->data + s*prev->nb[1]))[c];
+        for (int g = 0; g < Hn; ++g) {
+            float w1, w2;
+            if (is_v) {
+                const float av = ld(c, s, oS + g);
+                w1 = (1.0f - av)/(float) R;
+                w2 = av/(float) R;
+            } else {
+                const float ck = ld(c, s, oS + g);
+                const float ak = ld(c, s, oS + Hn + g);
+                w1 = ck*(1.0f - ak);
+                w2 = ck*ak;
+            }
+            ggml_fp16_t * y = (ggml_fp16_t *) ((char *) dst->data + g*dst->nb[1] + c*dst->nb[2] + s*dst->nb[3]);
+            for (int64_t d = 0; d < Dh; ++d) {
+                float x = 0.0f, xp = 0.0f;
+                for (int r = 0; r < R; ++r) {
+                    x += ld(c, s, oA + g*R + r)*ld(c, s, r*Dh + d);
+                    if (p >= 0) {
+                        xp += ld(p, s, oA + g*R + r)*ld(p, s, r*Dh + d);
+                    }
+                }
+                y[d] = GGML_CPU_FP32_TO_FP16(w1*x + w2*xp);
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_olala_diff_gate(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * attn = dst->src[0];
+    const ggml_tensor * lam  = dst->src[1];
+    const ggml_tensor * gs   = dst->src[2];
+
+    const int64_t Dh = attn->ne[0];
+    const int64_t H  = attn->ne[1];
+    const int64_t T  = attn->ne[2];
+    const int64_t Hn = lam->ne[0];
+    const int64_t Hs = H - Hn;
+    const int64_t snr = Hs/Hn;
+
+    const float * a = (const float *) attn->data;
+    const int64_t lam_s = lam->nb[1]/sizeof(float);
+    const int64_t gs_s  = gs->nb[1]/sizeof(float);
+    float * y = (float *) dst->data;
+
+    const int64_t n = T*Hs*Dh;
+    const int64_t i0 = n*params->ith/params->nth;
+    const int64_t i1 = n*(params->ith + 1)/params->nth;
+    for (int64_t i = i0; i < i1; ++i) {
+        const int64_t t  = i/(Hs*Dh);
+        const int64_t j  = i - t*Hs*Dh;      // (hn*snr + k)*Dh + d
+        const int64_t hs = j/Dh;
+        const int64_t d  = j - hs*Dh;
+        const int64_t hn = hs/snr;
+        const int64_t k  = hs - hn*snr;
+        const float sig = a[(t*H + hn*(snr + 1) + k)*Dh + d];
+        const float noi = a[(t*H + hn*(snr + 1) + snr)*Dh + d];
+        const float l   = ((const float *) lam->data)[t*lam_s + hn];
+        const float g   = ((const float *) gs->data)[t*gs_s + j];
+        y[i] = (sig - noi*l)*g;
     }
 }

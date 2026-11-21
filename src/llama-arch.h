@@ -191,6 +191,7 @@ enum llm_arch {
     LLM_ARCH_INKLING2,
     LLM_ARCH_INKLING2_LOOP,
     LLM_ARCH_DOMYN_EDGE,
+    LLM_ARCH_OLALA,
     LLM_ARCH_UNKNOWN,
 };
 
@@ -671,6 +672,20 @@ enum llm_tensor {
     LLM_TENSOR_FFN_RESID_BETA,
     LLM_TENSOR_ATTN_Q_NORM,
     LLM_TENSOR_ATTN_K_NORM,
+    // Olala DifferentialTensorProductAttentionV2
+    LLM_TENSOR_ATTN_WA_K,           // olala: TPA factor A for K       (hidden -> n_kv * rank)
+    LLM_TENSOR_ATTN_WA_V,           // olala: TPA factor A for V       (hidden -> n_kv * rank)
+    LLM_TENSOR_ATTN_WB_K,           // olala: TPA factor B for K       (hidden -> rank * head_dim)
+    LLM_TENSOR_ATTN_WB_V,           // olala: TPA factor B for V       (hidden -> rank * head_dim)
+    LLM_TENSOR_ATTN_SHIFT_K,        // olala: token-shift α projection for K  (hidden -> n_kv)
+    LLM_TENSOR_ATTN_SHIFT_V,        // olala: token-shift α projection for V  (hidden -> n_kv)
+    LLM_TENSOR_ATTN_LAMBDA,         // olala: diff-V2 λ projection            (hidden -> n_noise)
+    LLM_TENSOR_ATTN_SOFTMAX_SCALER, // olala: scalable-softmax per-head scaler (n_head,)
+    // Olala geodesic residual (one pair per residual update; two per block)
+    LLM_TENSOR_GEODESIC_MIXER_SCALE,
+    LLM_TENSOR_GEODESIC_MIXER_BIAS,
+    LLM_TENSOR_GEODESIC_MLP_SCALE,
+    LLM_TENSOR_GEODESIC_MLP_BIAS,
     LLM_TENSOR_LAYER_OUT_NORM,
     LLM_TENSOR_LAYER_OUT_SCALE,
     LLM_TENSOR_ATTN_VRES_LAMBDA,
@@ -706,6 +721,19 @@ enum llm_tensor {
     LLM_TENSOR_SSM_OUT,
     LLM_TENSOR_SSM_BETA_ALPHA,      // qwen3next
     LLM_TENSOR_SSM_ALPHA,           // qwen3.5
+    // Olala Mamba3-MIMO: in_proj is split into a "static" part (z,x,dt,A,trap)
+    // and a "dynamic" part (B,C,angles); per-head biases and MIMO projections.
+    LLM_TENSOR_SSM_IN_DYN,          // olala: in_proj_dyn (B,C,angles)
+    LLM_TENSOR_SSM_B_BIAS,          // olala: per-head bias on B before SSM
+    LLM_TENSOR_SSM_C_BIAS,          // olala: per-head bias on C before SSM
+    LLM_TENSOR_SSM_DT_BIAS,         // olala: per-head dt bias (additive before softplus)
+    LLM_TENSOR_SSM_MIMO_X,          // olala: MIMO up-proj for x  (nheads, R, headdim)
+    LLM_TENSOR_SSM_MIMO_Z,          // olala: MIMO up-proj for z  (nheads, R, headdim)
+    LLM_TENSOR_SSM_MIMO_O,          // olala: MIMO down-proj for output (nheads, R, headdim)
+    LLM_TENSOR_SSM_M3_BIAS,         // olala: packed GGML_OP_MAMBA3_MIMO constants (optional)
+    LLM_TENSOR_SSM_M3_MXZ,
+    LLM_TENSOR_SSM_M3_NORMS,
+    LLM_TENSOR_SSM_M3_MISC,
     // Kimi Linear KDA (using SSM_ prefix for consistency)
     LLM_TENSOR_SSM_CONV1D_Q,        // kimi: Q conv1d weight
     LLM_TENSOR_SSM_CONV1D_K,        // kimi: K conv1d weight

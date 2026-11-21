@@ -87,6 +87,8 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "Dots3NoteForConditionalGeneration": "dots3",
     "Dots3NoteTextForCausalLM": "dots3",
     "DotsOCRForCausalLM": "qwen",
+    "DragonForCausalLM": "olala",
+    "OlalaForCausalLM": "olala",
     "DreamModel": "dream",
     "EmbeddingGemma2Model": "gemma",
     "Ernie4_5ForCausalLM": "ernie",
