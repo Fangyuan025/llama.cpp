@@ -755,6 +755,89 @@ kernel void kernel_dsv4_hc_comb_f32(
     }
 }
 
+// Two streams, as SenseNova Loop routes them: one thread a token, the closed form of the finite Sinkhorn
+// iteration the CPU's ggml_dsv4_hc_comb_two computes, with the unary kernel's softplus. Twenty iterations
+// unrolled into the graph were some seventy kernels a router, every pass of every token.
+static inline float dsv4_hc_softplus(float x) {
+    return select(log(1.0f + exp(x)), x, x > 20.0f);
+}
+
+kernel void kernel_dsv4_hc_comb_two_f32(
+        constant ggml_metal_kargs_dsv4_hc_comb & args,
+        device const char * mixes,
+        device const char * scale,
+        device const char * base,
+        device       char * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    const int it = tpig;
+    if (it >= args.n_tokens) {
+        return;
+    }
+
+    const float scale_comb = *(device const float *) (scale + 2*args.nb_s0);
+
+    float c[4];
+    for (int i = 0; i < 4; ++i) {
+        c[i] = *(device const float *) (mixes + (4 + i)*args.nb_m0 + it*args.nb_m1)*scale_comb
+             + *(device const float *) (base  + (4 + i)*args.nb_b0);
+    }
+
+    const float d0 = c[0] - c[1];
+    const float d1 = c[2] - c[3];
+    if (fabs(d0) > FLT_MAX/8 || fabs(d1) > FLT_MAX/8) {
+        // differences past the float range: the log-domain iteration
+        for (int n = 0; n < args.n_iter; ++n) {
+            for (int axis = 0; axis < 2; ++axis) {
+                for (int row = 0; row < 2; ++row) {
+                    const int i = axis == 0 ? 2*row : row;
+                    const int j = i + (axis == 0 ? 1 : 2);
+                    const float diff = c[i] - c[j];
+                    const float norm = log(1.0f + exp(-fabs(diff)));
+                    c[i] = -max(-diff, 0.0f) - norm;
+                    c[j] = -max( diff, 0.0f) - norm;
+                }
+            }
+        }
+        for (int i = 0; i < 4; ++i) {
+            c[i] = exp(c[i]);
+        }
+    } else {
+        float a = dsv4_hc_softplus(-d1) - dsv4_hc_softplus(-d0);
+        float b = dsv4_hc_softplus( d1) - dsv4_hc_softplus( d0);
+        if (args.n_iter > 1) {
+            const float hi    = max(a, 0.0f) + max(b, 0.0f);
+            const float lo    = -(max(-a, 0.0f) + max(-b, 0.0f));
+            const float range = hi - lo;
+            const float log_two = M_LN2_F;
+            float power = -dsv4_hc_softplus(-range) + log_two;
+            float sum = 0.0f;
+            bool have_sum = false;
+            for (uint n = args.n_iter - 1; n; n >>= 1) {
+                if (n & 1) {
+                    sum = have_sum ? (sum + dsv4_hc_softplus(power - sum)) - dsv4_hc_softplus((sum + power) - range) : power;
+                    have_sum = true;
+                }
+                if (n > 1) {
+                    power = (power - dsv4_hc_softplus(2.0f*power - range)) + log_two;
+                }
+            }
+            const float shift = dsv4_hc_softplus(sum - hi) - dsv4_hc_softplus(sum + lo);
+            a += shift;
+            b += shift;
+        }
+        c[0] = 1.0f/(1.0f + exp(-a));
+        c[1] = 1.0f/(1.0f + exp(-b));
+        c[2] = 1.0f/(1.0f + exp( a));
+        c[3] = 1.0f/(1.0f + exp( b));
+    }
+
+    for (int isrc = 0; isrc < 2; ++isrc) {
+        for (int idst = 0; idst < 2; ++idst) {
+            *(device float *) (dst + idst*args.nb_d0 + isrc*args.nb_d1 + it*args.nb_d2) = c[idst + 2*isrc];
+        }
+    }
+}
+
 kernel void kernel_dsv4_hc_pre_f32(
         constant ggml_metal_kargs_dsv4_hc_pre & args,
         device const char * x,
@@ -904,6 +987,64 @@ kernel void kernel_dsv4_hc_post_f32(
 
     FOR_UNROLL (ushort idst = 0; idst < hc; ++idst) {
         *(device float *) (dst + i0*args.nb_d0 + idst*args.nb_d1 + it*args.nb_d2) = result[idst];
+    }
+}
+
+// Two streams: each thread one element of both outputs, the mixing matrix read through its strides (SenseNova
+// Loop hands it over transposed), summed in the order the CPU sums it.
+kernel void kernel_dsv4_hc_post_two_f32(
+        constant ggml_metal_kargs_dsv4_hc_post & args,
+        device const char * x,
+        device const char * residual,
+        device const char * post,
+        device const char * comb,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const int it = tgpig.y;
+    const int i0 = ((int) tgpig.x*ntg.y + sgitg)*32 + tiisg;
+
+    if (i0 >= args.n_embd) {
+        return;
+    }
+
+    const float xv = *(device const float *) (x + i0*args.nb_x0 + it*args.nb_x1);
+    device const char * rb = residual + i0*args.nb_r0 + it*args.nb_r2;
+    const float a = *(device const float *) (rb);
+    const float b = *(device const float *) (rb + args.nb_r1);
+
+    for (int idst = 0; idst < 2; ++idst) {
+        const float p  = *(device const float *) (post + idst*args.nb_p0 + it*args.nb_p1);
+        const float ca = *(device const float *) (comb + idst*args.nb_c0 +              it*args.nb_c2);
+        const float cb = *(device const float *) (comb + idst*args.nb_c0 + args.nb_c1 + it*args.nb_c2);
+        *(device float *) (dst + i0*args.nb_d0 + idst*args.nb_d1 + it*args.nb_d2) = (a*ca + b*cb) + xv*p;
+    }
+}
+
+kernel void kernel_dsv4_hc_post_two_nocomb_f32(
+        constant ggml_metal_kargs_dsv4_hc_post & args,
+        device const char * x,
+        device const char * residual,
+        device const char * post,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const int it = tgpig.y;
+    const int i0 = ((int) tgpig.x*ntg.y + sgitg)*32 + tiisg;
+
+    if (i0 >= args.n_embd) {
+        return;
+    }
+
+    const float xv = *(device const float *) (x + i0*args.nb_x0 + it*args.nb_x1);
+    device const char * rb = residual + i0*args.nb_r0 + it*args.nb_r2;
+    for (int idst = 0; idst < 2; ++idst) {
+        const float p = *(device const float *) (post + idst*args.nb_p0 + it*args.nb_p1);
+        *(device float *) (dst + i0*args.nb_d0 + idst*args.nb_d1 + it*args.nb_d2) = *(device const float *) (rb + idst*args.nb_r1) + xv*p;
     }
 }
 

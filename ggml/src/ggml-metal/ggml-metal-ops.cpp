@@ -1617,8 +1617,8 @@ int ggml_metal_op_dsv4_hc(ggml_metal_op_t ctx, int idx) {
                 GGML_ASSERT(scale->type == GGML_TYPE_F32);
                 GGML_ASSERT(base->type  == GGML_TYPE_F32);
                 GGML_ASSERT(op->type    == GGML_TYPE_F32);
-                GGML_ASSERT(mixes->ne[0] == 24);
-                GGML_ASSERT(op->ne[0] == 4 && op->ne[1] == 4);
+                GGML_ASSERT(mixes->ne[0] == 24 || mixes->ne[0] == 8);
+                GGML_ASSERT(op->ne[0] == op->ne[1] && op->ne[0] == (mixes->ne[0] == 8 ? 2 : 4));
 
                 ggml_metal_kargs_dsv4_hc_comb args = {
                     /*.n_tokens =*/ (int32_t) mixes->ne[1],
@@ -1638,6 +1638,13 @@ int ggml_metal_op_dsv4_hc(ggml_metal_op_t ctx, int idx) {
                 ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(scale), 2);
                 ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(base),  3);
                 ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op),    4);
+
+                if (mixes->ne[0] == 8) {
+                    // two streams: one thread a token
+                    const int nth = std::min(64, args.n_tokens);
+                    ggml_metal_encoder_dispatch_threadgroups(enc, (args.n_tokens + nth - 1)/nth, 1, 1, nth, 1, 1);
+                    break;
+                }
 
                 // One SIMDgroup owns one 4x4 Sinkhorn matrix. Packing up to four
                 // independent tokens per threadgroup keeps both decode and prompt
@@ -1690,7 +1697,7 @@ int ggml_metal_op_dsv4_hc(ggml_metal_op_t ctx, int idx) {
                 GGML_ASSERT(residual->type == GGML_TYPE_F32);
                 GGML_ASSERT(post->type     == GGML_TYPE_F32);
                 GGML_ASSERT(op->type       == GGML_TYPE_F32);
-                GGML_ASSERT(residual->ne[1] == 4);
+                GGML_ASSERT(residual->ne[1] == 4 || residual->ne[1] == 2);
 
                 ggml_metal_kargs_dsv4_hc_post args = {
                     /*.n_embd   =*/ (int32_t) x->ne[0],

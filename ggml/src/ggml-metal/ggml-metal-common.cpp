@@ -274,6 +274,12 @@ bool ggml_metal_op_mul_mat_use_mm(const struct ggml_tensor * op, bool has_simdgr
     const int64_t ne00 = op->src[0]->ne[0];
     const int64_t ne11 = op->src[1]->ne[1];
 
+    // a float32 product asked to stay float32 (SenseNova Loop's mHC routing): the matrix-matrix kernels stage src1
+    // as half, the mat-vec ones keep it, and these are a few rows of output each
+    if (op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && ggml_prec_get_src(op, 1) == GGML_PREC_F32) {
+        return false;
+    }
+
     return !ggml_is_transposed(op->src[0]) &&
            !ggml_is_transposed(op->src[1]) &&
            has_simdgroup_mm && ne11 > 8 && ne00 >= 32;
