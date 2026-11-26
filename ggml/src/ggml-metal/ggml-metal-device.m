@@ -1514,7 +1514,9 @@ static bool ggml_metal_supports_mul_mat_src1_prec(const struct ggml_tensor * op,
     const enum ggml_prec prec = ggml_prec_get_src(op, 1);
 
     if (prec == GGML_PREC_F32) {
-        return false;
+        // the mat-vec kernels read src1 as float and accumulate in float, and ggml_metal_op_mul_mat_use_mm keeps such
+        // a product off the matrix-matrix kernels, which stage src1 as half (SenseNova Loop's mHC routing)
+        return op->op == GGML_OP_MUL_MAT && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
     }
     if (prec == GGML_PREC_BF16) {
         return has_tensor && op->op == GGML_OP_MUL_MAT && op->src[0]->type != GGML_TYPE_F32;
