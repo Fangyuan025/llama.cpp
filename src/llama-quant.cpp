@@ -3208,6 +3208,15 @@ static void init_quantize_state_counters(quantize_state_impl & qs, std::vector<t
     }
 
     qs.n_ffn_down = qs.n_ffn_gate = qs.n_ffn_up = (int)qs.model.hparams.n_layer_all;
+    if (qs.model.arch == LLM_ARCH_DORY) {
+        // The mixed recipe counts physical FFNs, not recurrent cache slots.
+        qs.n_ffn_down = qs.n_ffn_gate = qs.n_ffn_up = 0;
+        for (const auto & tm : metadata) {
+            if (tm.category == TENSOR_CATEGORY_FFN_DOWN) { ++qs.n_ffn_down; }
+            if (tm.category == TENSOR_CATEGORY_FFN_GATE) { ++qs.n_ffn_gate; }
+            if (tm.category == TENSOR_CATEGORY_FFN_UP)   { ++qs.n_ffn_up; }
+        }
+    }
 }
 
 // main quantization driver
