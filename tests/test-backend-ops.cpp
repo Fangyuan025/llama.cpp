@@ -5263,6 +5263,7 @@ struct test_dsv4_hc_comb : public test_dsv4_hc {
     const int64_t n_tokens;
     const int32_t n_iter;
     const float eps;
+    const int64_t n_hc;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -5270,13 +5271,14 @@ struct test_dsv4_hc_comb : public test_dsv4_hc {
     }
 
     std::string vars() override {
-        return VARS_TO_STR3(n_tokens, n_iter, eps);
+        return VARS_TO_STR4(n_tokens, n_iter, eps, n_hc);
     }
 
-    test_dsv4_hc_comb(int64_t n_tokens = 17, int32_t n_iter = 4, float eps = 1e-6f)
-        : n_tokens(n_tokens), n_iter(n_iter), eps(eps) {}
+    test_dsv4_hc_comb(int64_t n_tokens = 17, int32_t n_iter = 4, float eps = 1e-6f, int64_t n_hc = 4)
+        : n_tokens(n_tokens), n_iter(n_iter), eps(eps), n_hc(n_hc) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t hc = n_hc;
         ggml_tensor * mixes = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (2 + hc)*hc, n_tokens);
         ggml_set_name(mixes, "mixes");
 
@@ -5289,6 +5291,83 @@ struct test_dsv4_hc_comb : public test_dsv4_hc {
         out = ggml_dsv4_hc_comb(ctx, mixes, scale, base, eps, n_iter);
         ggml_set_name(out, "out");
         return out;
+    }
+};
+
+struct test_dsv4_hc_comb_reference : public test_dsv4_hc_comb {
+    const bool strided;
+    ggml_tensor * storage = nullptr;
+    std::vector<double> expected;
+
+    test_dsv4_hc_comb_reference(int32_t n_iter, bool strided)
+        : test_dsv4_hc_comb(17, n_iter, 0.0f, 2), strided(strided) {}
+
+    std::string op_desc(ggml_tensor *) override { return "DSV4_HC_COMB_REFERENCE"; }
+    std::string vars() override { return test_dsv4_hc_comb::vars() + "," + VAR_TO_STR(strided); }
+    bool run_whole_graph() override { return true; }
+    double max_err(ggml_backend_t) override { return 2e-5; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        test_dsv4_hc_comb::build_graph(ctx);
+        storage = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, strided ? 17 : 8, n_tokens);
+        out->src[0] = strided ? ggml_view_2d(ctx, storage, 8, n_tokens, storage->nb[1], sizeof(float)) : storage;
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_dsv4_hc::initialize_tensors(ctx);
+        const std::array<float, 4> values[] = {
+            {0, 0, 0, 0}, {2, 2, 2, 2}, {-10, 1, 9, -2},
+            {2000, 0, 1000, 0}, {-2000, 0, -1000, 0},
+            {2e6f, 0, 1e6f, 0}, {-2e6f, 0, -1e6f, 0},
+            {-10000, 10000, 10000, -10000},
+            {1e6f, 1e6f + 1, -1e6f, -1e6f + 2},
+            {3e38f, -3e38f, 3e38f, -3e38f},
+            {-3e38f, 3e38f, -3e38f, 3e38f},
+            {3e38f, -3e38f, -3e38f, 3e38f}, {3e38f, 0, 0, -3e38f},
+        };
+        std::mt19937 rng(1234);
+        std::uniform_real_distribution<float> dist(-32.0f, 32.0f);
+        std::vector<float> data(ggml_nelements(storage), 0.0f);
+        expected.resize(4*n_tokens);
+        for (int64_t it = 0; it < n_tokens; ++it) {
+            std::array<double, 4> logs;
+            for (size_t i = 0; i < logs.size(); ++i) {
+                const float v = it < int64_t(sizeof(values)/sizeof(values[0])) ? values[it][i] : dist(rng);
+                data[it*storage->ne[0] + (strided ? 1 : 0) + 4 + i] = v;
+                logs[i] = v;
+            }
+            auto normalize = [&](int a, int b) {
+                const double diff = logs[a] - logs[b];
+                const double norm = std::log1p(std::exp(-std::abs(diff)));
+                logs[a] = -std::max(-diff, 0.0) - norm;
+                logs[b] = -std::max( diff, 0.0) - norm;
+            };
+            for (int32_t i = 0; i < n_iter; ++i) {
+                normalize(0, 1);
+                normalize(2, 3);
+                normalize(0, 2);
+                normalize(1, 3);
+            }
+            for (size_t i = 0; i < logs.size(); ++i) {
+                expected[4*it + i] = std::exp(logs[i]);
+            }
+        }
+        const float scale[] = {1, 1, 1};
+        const float base[8] = {};
+        ggml_backend_tensor_set(storage, data.data(), 0, data.size()*sizeof(float));
+        ggml_backend_tensor_set(out->src[1], scale, 0, sizeof(scale));
+        ggml_backend_tensor_set(out->src[2], base, 0, sizeof(base));
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        GGML_ASSERT(n == expected.size());
+        double error = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            error = std::max(error, std::abs(a[i] - expected[i]));
+            error = std::max(error, std::abs(b[i] - expected[i]));
+        }
+        return error;
     }
 };
 
@@ -5335,6 +5414,8 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
     const int64_t n_tokens;
     const bool    identity;
     const bool    gated;
+    const int64_t n_hc;
+    const bool    transpose_comb;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -5342,33 +5423,36 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
     }
 
     std::string vars() override {
-        return VARS_TO_STR4(n_embd, n_tokens, identity, gated);
+        return VARS_TO_STR6(n_embd, n_tokens, identity, gated, n_hc, transpose_comb);
     }
 
     // gated: post = 2*sigmoid(post/hc), as qwen4exp builds it, so backends can fuse the chain
     bool run_whole_graph() override { return gated; }
 
-    test_dsv4_hc_post(int64_t n_embd = 31, int64_t n_tokens = 17, bool identity = false, bool gated = false)
-        : n_embd(n_embd), n_tokens(n_tokens), identity(identity), gated(gated) {}
+    test_dsv4_hc_post(int64_t n_embd = 31, int64_t n_tokens = 17, bool identity = false, bool gated = false, int64_t n_hc = 4, bool transpose_comb = false)
+        : n_embd(n_embd), n_tokens(n_tokens), identity(identity), gated(gated), n_hc(n_hc), transpose_comb(transpose_comb) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
         ggml_set_name(x, "x");
 
-        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_hc, n_tokens);
         ggml_set_name(residual, "residual");
 
-        ggml_tensor * post = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+        ggml_tensor * post = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_hc, n_tokens);
         ggml_set_name(post, "post");
 
         if (gated) {
-            post = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, post, 1.0f / (float) hc)), 2.0f);
+            post = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, post, 1.0f / (float) n_hc)), 2.0f);
         }
 
         ggml_tensor * comb = nullptr;
         if (!identity) {
-            comb = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hc, hc, n_tokens);
+            comb = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_hc, n_hc, n_tokens);
             ggml_set_name(comb, "comb");
+            if (transpose_comb) {
+                comb = ggml_permute(ctx, comb, 1, 0, 2, 3);
+            }
         }
 
         out = ggml_dsv4_hc_post(ctx, x, residual, post, comb);
@@ -12090,6 +12174,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_comb(17, 4));
     test_cases.emplace_back(new test_dsv4_hc_comb(257, 8));
     test_cases.emplace_back(new test_dsv4_hc_comb(17, 20));
+    for (int64_t n_tokens : {1, 17, 512, 513}) {
+        for (int32_t n_iter : {1, 2, 20}) {
+            test_cases.emplace_back(new test_dsv4_hc_comb(n_tokens, n_iter, 0.0f, 2));
+        }
+    }
+    for (int32_t n_iter = 1; n_iter <= 20; ++n_iter) {
+        for (bool strided : {false, true}) {
+            test_cases.emplace_back(new test_dsv4_hc_comb_reference(n_iter, strided));
+        }
+    }
     // production n_iter (DeepSeek-V4 uses 20) across batch sizes that cross
     // subgroup and workgroup boundaries; 1 = single-token decode
     for (int64_t n_tokens : {1, 256, 336, 512, 513, 1024, 2048}) {
@@ -12118,6 +12212,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, false, true));
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 1));             // DeepSeek-V4-Flash decode
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 1, true, true)); // Qwen4-Exp decode
+    for (int64_t n_tokens : {1, 17, 512}) {
+        test_cases.emplace_back(new test_dsv4_hc_pre(4096, 2, n_tokens));
+        test_cases.emplace_back(new test_dsv4_hc_post(4096, n_tokens, false, false, 2, true));
+        test_cases.emplace_back(new test_dsv4_hc_post(31, n_tokens, true, false, 2));
+    }
     for (int64_t n_embd : {96, 256}) {
         for (int64_t n_tokens : {1, 64}) {
             test_cases.emplace_back(new test_dsv4_hc_chain(GGML_TYPE_Q4_0, n_embd, n_tokens, true,  true));

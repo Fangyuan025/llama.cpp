@@ -554,7 +554,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc(ggml_met
 
     switch (op->op) {
         case GGML_OP_DSV4_HC_COMB:
-            base = "kernel_dsv4_hc_comb_f32";
+            base = op->src[0]->ne[0] == 8 ? "kernel_dsv4_hc_comb_two_f32" : "kernel_dsv4_hc_comb_f32";
             snprintf(name, 256, "%s", base);
             break;
         case GGML_OP_DSV4_HC_PRE:
@@ -562,7 +562,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc(ggml_met
             snprintf(name, 256, "%s_n_hc=%d", base, (int) op->src[0]->ne[1]);
             break;
         case GGML_OP_DSV4_HC_POST:
-            base = op->src[3] ? "kernel_dsv4_hc_post_f32" : "kernel_dsv4_hc_post_nocomb_f32";
+            if (op->src[1]->ne[1] == 2) {
+                base = op->src[3] ? "kernel_dsv4_hc_post_two_f32" : "kernel_dsv4_hc_post_two_nocomb_f32";
+            } else {
+                base = op->src[3] ? "kernel_dsv4_hc_post_f32" : "kernel_dsv4_hc_post_nocomb_f32";
+            }
             snprintf(name, 256, "%s", base);
             break;
         default:
