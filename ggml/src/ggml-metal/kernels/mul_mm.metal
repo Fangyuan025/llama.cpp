@@ -402,16 +402,27 @@ kernel void kernel_mul_mm_id_zero(
 
 typedef decltype(kernel_mul_mm_id_map0<1>) kernel_mul_mm_id_map0_t;
 
-template [[host_name("kernel_mul_mm_id_map0_ne20_1" )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<1>;
-template [[host_name("kernel_mul_mm_id_map0_ne20_2" )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<2>;
-template [[host_name("kernel_mul_mm_id_map0_ne20_4" )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<4>;
-template [[host_name("kernel_mul_mm_id_map0_ne20_5" )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<5>;
-template [[host_name("kernel_mul_mm_id_map0_ne20_6" )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<6>;
-template [[host_name("kernel_mul_mm_id_map0_ne20_8" )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<8>;
-template [[host_name("kernel_mul_mm_id_map0_ne20_9" )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<9>;
-template [[host_name("kernel_mul_mm_id_map0_ne20_10")]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<10>;
-template [[host_name("kernel_mul_mm_id_map0_ne20_16")]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<16>;
-template [[host_name("kernel_mul_mm_id_map0_ne20_22")]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<22>;
+// every count of experts a token up to 16, and 22, 24, 32 (ggml_metal_has_mm_id_map0 lists them): without its
+// own map kernel, a model routing to another count (Maxwell-V1: 12) got no pipeline and crashed the prefill
+template [[host_name("kernel_mul_mm_id_map0_ne20_1"  )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<1>;
+template [[host_name("kernel_mul_mm_id_map0_ne20_2"  )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<2>;
+template [[host_name("kernel_mul_mm_id_map0_ne20_3"  )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<3>;
+template [[host_name("kernel_mul_mm_id_map0_ne20_4"  )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<4>;
+template [[host_name("kernel_mul_mm_id_map0_ne20_5"  )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<5>;
+template [[host_name("kernel_mul_mm_id_map0_ne20_6"  )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<6>;
+template [[host_name("kernel_mul_mm_id_map0_ne20_7"  )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<7>;
+template [[host_name("kernel_mul_mm_id_map0_ne20_8"  )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<8>;
+template [[host_name("kernel_mul_mm_id_map0_ne20_9"  )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<9>;
+template [[host_name("kernel_mul_mm_id_map0_ne20_10" )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<10>;
+template [[host_name("kernel_mul_mm_id_map0_ne20_11" )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<11>;
+template [[host_name("kernel_mul_mm_id_map0_ne20_12" )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<12>;
+template [[host_name("kernel_mul_mm_id_map0_ne20_13" )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<13>;
+template [[host_name("kernel_mul_mm_id_map0_ne20_14" )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<14>;
+template [[host_name("kernel_mul_mm_id_map0_ne20_15" )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<15>;
+template [[host_name("kernel_mul_mm_id_map0_ne20_16" )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<16>;
+template [[host_name("kernel_mul_mm_id_map0_ne20_22" )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<22>;
+template [[host_name("kernel_mul_mm_id_map0_ne20_24" )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<24>;
+template [[host_name("kernel_mul_mm_id_map0_ne20_32" )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<32>;
 
 template<typename S0, typename S1, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread typename value_type_4x4<S0>::type &), typename T0, typename T1>
 kernel void kernel_mul_mm_id(
